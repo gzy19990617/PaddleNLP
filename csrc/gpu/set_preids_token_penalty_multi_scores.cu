@@ -15,7 +15,7 @@
 #include "helper.h"
 
 template<typename T>
-__global__ void update_value_all(const bool *stop_flags,
+__global__ void set_preids_token_penalty_multi_scores_kernel(const bool *stop_flags,
                                  int64_t *pre_ids,
                                  const int64_t *input_ids, 
                                  const int *seq_lens_encoder, 
@@ -98,7 +98,7 @@ __global__ void update_value_all(const bool *stop_flags,
 }
 
 template <paddle::DataType D>
-void set_preids_token_penalty_multi_scores_kernel(const paddle::Tensor& pre_ids,
+void set_preids_token_penalty_multi_scores(const paddle::Tensor& pre_ids,
                                                   const paddle::Tensor& input_ids,
                                                   const paddle::Tensor& seq_lens_encoder,
                                                   const paddle::Tensor& seq_lens_decoder,
@@ -128,7 +128,7 @@ void set_preids_token_penalty_multi_scores_kernel(const paddle::Tensor& pre_ids,
 
     int64_t end_length = eos_token_id.shape()[0];
 
-    update_value_all<DataType_><<<bs, 1024, 0, cu_stream>>>(
+    set_preids_token_penalty_multi_scores_kernel<DataType_><<<bs, 1024, 0, cu_stream>>>(
         stop_flags.data<bool>(), 
         const_cast<int64_t*>(pre_ids.data<int64_t>()),
         input_ids.data<int64_t>(), 
@@ -172,7 +172,7 @@ void SetPreidsTokenPenaltyMultiScores(const paddle::Tensor& pre_ids,
 
     switch (logits.type()) {
         case paddle::DataType::BFLOAT16: {
-            return set_preids_token_penalty_multi_scores_kernel<paddle::DataType::BFLOAT16>(
+            return set_preids_token_penalty_multi_scores<paddle::DataType::BFLOAT16>(
                 pre_ids,
                 input_ids,
                 seq_lens_encoder,
@@ -191,7 +191,7 @@ void SetPreidsTokenPenaltyMultiScores(const paddle::Tensor& pre_ids,
             );
         }
         case paddle::DataType::FLOAT16: {
-            return set_preids_token_penalty_multi_scores_kernel<paddle::DataType::FLOAT16>(
+            return set_preids_token_penalty_multi_scores<paddle::DataType::FLOAT16>(
                 pre_ids,
                 input_ids,
                 seq_lens_encoder,
@@ -210,7 +210,7 @@ void SetPreidsTokenPenaltyMultiScores(const paddle::Tensor& pre_ids,
             );
         }
         case paddle::DataType::FLOAT32: {
-            return set_preids_token_penalty_multi_scores_kernel<paddle::DataType::FLOAT32>(
+            return set_preids_token_penalty_multi_scores<paddle::DataType::FLOAT32>(
                 pre_ids,
                 input_ids,
                 seq_lens_encoder,

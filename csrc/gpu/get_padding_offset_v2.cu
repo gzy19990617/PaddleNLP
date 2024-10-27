@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "paddle/extension.h"
+#include "helper.h"
 
 __global__ void GetPaddingOffsetV2Kernel(int *padding_offset,
                                          int *cum_offsets_out,
@@ -54,10 +55,12 @@ std::vector<paddle::Tensor> GetPaddingOffsetV2(const paddle::Tensor& input_ids,
     auto cpu_token_num = token_num.copy_to(paddle::CPUPlace(), false);
 
     const int token_num_data = cpu_token_num.data<int64_t>()[0];
-    auto x_remove_padding = paddle::full({token_num_data}, 0, paddle::DataType::INT64, input_ids.place());
-    auto padding_offset = paddle::full({token_num_data}, 0, paddle::DataType::INT32, input_ids.place());
-    auto cu_seqlens_q = paddle::full({bsz + 1}, 0, paddle::DataType::INT32, input_ids.place());
-    auto cu_seqlens_k = paddle::full({bsz + 1}, 0, paddle::DataType::INT32, input_ids.place());
+
+    auto x_remove_padding = GetEmptyTensor({token_num_data}, paddle::DataType::INT64, input_ids.place());
+    auto padding_offset = GetEmptyTensor({token_num_data}, paddle::DataType::INT32, input_ids.place());
+    auto cu_seqlens_q = GetEmptyTensor({bsz + 1}, paddle::DataType::INT32, input_ids.place());
+    auto cu_seqlens_k = GetEmptyTensor({bsz + 1}, paddle::DataType::INT32, input_ids.place());
+
     GetPaddingOffsetV2Kernel<<<bsz, 128, 0, cu_stream>>>(
       padding_offset.data<int>(), 
       cum_offsets_out.data<int>(),
