@@ -35,6 +35,10 @@ __global__ void GetPaddingOffsetV2Kernel(int *padding_offset,
     output_data[tgt_seq_id] = input_data[src_seq_id];
   }
   if (ti == 0) {
+    if (bi == 0) {
+      cu_seqlens_q[0] = 0;
+      cu_seqlens_k[0] = 0;
+    }
     cum_offsets_out[bi] = cum_offset;
     int cum_seq_len = (bi + 1) * max_seq_len - cum_offsets[bi];
     cu_seqlens_q[bi + 1] = cum_seq_len;
