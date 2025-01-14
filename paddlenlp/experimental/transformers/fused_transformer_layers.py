@@ -112,7 +112,7 @@ class MoeConfig:
     num_experts: int = 0
     top_k: int = 0
     topk_method: Optional[str] = None
-    num_expert_group: int = 0
+    num_expert_group: int = 1
     topk_group: Optional[int] = None
     norm_topk_prob: bool = True
     moe_every2: bool = False
