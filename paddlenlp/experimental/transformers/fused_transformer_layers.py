@@ -27,6 +27,9 @@ from paddle.incubate.nn.functional import (
     fused_moe,
     fused_rms_norm,
     masked_multihead_attention,
+    moe_dispatch,
+    moe_ffn,
+    moe_reduce,
     variable_length_memory_efficient_attention,
 )
 from paddle.nn import Layer
@@ -323,15 +326,15 @@ class FusedMultiTransformerConfig:
         self.speculate_config = speculate_config
         self.mla_config = mla_config
 
+
 def get_moe_scores(
-        gating_output: paddle.Tensor,
-        config: MoeConfig,
-        e_score_correction_bias: Optional[paddle.Tensor] = None,
-    ) -> paddle.Tensor:
+    gating_output: paddle.Tensor,
+    config: MoeConfig,
+    e_score_correction_bias: Optional[paddle.Tensor] = None,
+) -> paddle.Tensor:
 
     num_token = gating_output.shape[0]
     num_expert_group = config.n_group
-    topk = config.top_k
     topk_group = config.topk_group
 
     # Compute softmax or sigmoid scores based on the topk_method
@@ -346,9 +349,13 @@ def get_moe_scores(
         if e_score_correction_bias is None:
             raise ValueError("e_score_correction_bias must be provided for 'noaux_tc' method.")
         scores = paddle.nn.functional.sigmoid(gating_output) + e_score_correction_bias.unsqueeze(0)
-        group_scores = scores.reshape([num_token, num_expert_group, -1]).topk(2, axis=-1)[0].sum(axis=-1)  # [n, n_group]
+        group_scores = (
+            scores.reshape([num_token, num_expert_group, -1]).topk(2, axis=-1)[0].sum(axis=-1)
+        )  # [n, n_group]
     else:
-        raise ValueError(f"Unsupported topk_method: {topk_method}. Please choose 'group_limited_greedy' or 'noaux_tc'.")
+        raise ValueError(
+            f"Unsupported topk_method: {config.topk_method}. Please choose 'group_limited_greedy' or 'noaux_tc'."
+        )
 
     # Identify top-k groups
     group_idx = paddle.topk(group_scores, k=topk_group, axis=-1, sorted=False)[1]  # [n, topk_group]
@@ -357,14 +364,18 @@ def get_moe_scores(
     group_mask.put_along_axis_(group_idx, 1, axis=1)
 
     # Apply group mask to the scores
-    score_mask = group_mask.unsqueeze(-1).expand(
-        [num_token, num_expert_group, scores.shape[-1] // num_expert_group]
-    ).reshape([num_token, -1]).astype('float32')  # [n, e]
-    
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand([num_token, num_expert_group, scores.shape[-1] // num_expert_group])
+        .reshape([num_token, -1])
+        .astype("float32")
+    )  # [n, e]
+
     # Scale the scores with the mask and scaling factor
     scores = scores * score_mask
 
     return scores
+
 
 class FusedMultiTransformerBase(Layer):
     def __init__(self, config: FusedMultiTransformerConfig):
@@ -461,6 +472,7 @@ class FusedMultiTransformerBase(Layer):
             ffn_ln_bias_attr = self.get_attr(config.ffn_ln_bias_attrs, i)
             ffn1_bias_attr = self.get_attr(config.ffn1_bias_attrs, i)
             ffn2_bias_attr = self.get_attr(config.ffn2_bias_attrs, i)
+            e_score_correction_bias_attr = self.get_attr(config.e_score_correction_bias_attrs, i)
 
             if self.config.moe_config.use_shared_expert(i):
                 if self.config.moe_config.shared_expert_with_gate:
@@ -548,11 +560,11 @@ class FusedMultiTransformerBase(Layer):
             e_score_correction_bias = None
             if self.config.moe_config.topk_method == "noaux_tc":
                 e_score_correction_bias = self.create_parameter(
-                        shape=[self.config.moe_config.num_experts]
-                        attr=e_score_correction_bias_attr,
-                        dtype="float32", # gate weight和bias均为fp32?需要确认一下
-                        is_bias=True,
-                    )
+                    shape=[self.config.moe_config.num_experts],
+                    attr=e_score_correction_bias_attr,
+                    dtype="float32",  # gate weight和bias应均为fp32
+                    is_bias=True,
+                )
             ffn2_bias = None
             if ffn2_bias_attr:
                 if self.config.moe_config.use_moe(i):
@@ -1101,14 +1113,14 @@ class FusedMultiTransformerBase(Layer):
             gate_out = paddle.matmul(tmp_out.cast("float32"), self.gate_weights[i])
             # 应用各种策略后重塑的scores
             scores = get_moe_scores(gate_out, self.config.moe_config, self.e_score_correction_biases[i])
-            
+
             # topk在moe_dispatch中
             (
                 permute_input,
                 token_nums_per_expert,
                 permute_indices_per_token,
                 expert_scales_float,
-                top_k_indices
+                top_k_indices,
             ) = moe_dispatch(tmp_out, scores, self.config.moe_config.top_k, False, topk_only_mode=True)
 
             ffn_out = moe_ffn(
@@ -1123,14 +1135,14 @@ class FusedMultiTransformerBase(Layer):
             if self.nranks > 1:
                 dist.all_reduce(ffn_out)
 
-            final_out = moe_reduce(
+            fused_moe_out = moe_reduce(
                 ffn_out,
                 expert_scales_float,
                 permute_indices_per_token,
                 top_k_indices,
                 self.ffn2_biases[i],
                 norm_topk_prob=self.config.moe_config.norm_topk_prob,
-                routed_scaling_factor=self.config.moe_config.routed_scaling_factor,# reduce中会做topk个weight的norm和routed_scaling_factor
+                routed_scaling_factor=self.config.moe_config.routed_scaling_factor,  # reduce中会做topk个weight的norm和routed_scaling_factor
             )
         else:
             fused_moe_out = fused_moe(
@@ -1593,19 +1605,58 @@ class FusedMultiTransformerWeightOnly(FusedMultiTransformerBase):
         )
 
     def compute_fused_moe(self, tmp_out, i):
-        fused_moe_out = fused_moe(
-            tmp_out,
-            self.gate_weights[i],
-            self.ffn1_weights[i],
-            self.ffn2_weights[i],
-            self.ffn1_biases[i],
-            self.ffn1_weights_scale[i],
-            self.ffn2_biases[i],
-            self.ffn2_weights_scale[i],
-            self.quant_type,
-            self.config.moe_config.top_k,
-            self.config.moe_config.norm_topk_prob,
-        )
+        if self.config.topk_method:
+            gate_out = paddle.matmul(tmp_out.cast("float32"), self.gate_weights[i])
+            # 应用各种策略后重塑的scores
+            scores = get_moe_scores(gate_out, self.config.moe_config, self.e_score_correction_biases[i])
+
+            # topk在moe_dispatch中
+            (
+                permute_input,
+                token_nums_per_expert,
+                permute_indices_per_token,
+                expert_scales_float,
+                top_k_indices,
+            ) = moe_dispatch(tmp_out, scores, self.config.moe_config.top_k, False, topk_only_mode=True)
+
+            ffn_out = moe_ffn(
+                permute_input,
+                token_nums_per_expert,
+                self.ffn1_weights[i],
+                self.ffn2_weights[i],
+                self.ffn1_biases[i],
+                self.ffn1_weights_scale[i],
+                self.ffn2_weights_scale[i],
+                self.quant_type,
+            )
+
+            # ffn1_biases要拆分tp的各个卡上，或者只在0卡上，省略此处reduce，减少一次reduce
+            if self.nranks > 1:
+                dist.all_reduce(ffn_out)
+
+            fused_moe_out = moe_reduce(
+                ffn_out,
+                expert_scales_float,
+                permute_indices_per_token,
+                top_k_indices,
+                self.ffn2_biases[i],
+                norm_topk_prob=self.config.moe_config.norm_topk_prob,
+                routed_scaling_factor=self.config.moe_config.routed_scaling_factor,  # reduce中会做topk个weight的norm和routed_scaling_factor
+            )
+        else:
+            fused_moe_out = fused_moe(
+                tmp_out,
+                self.gate_weights[i],
+                self.ffn1_weights[i],
+                self.ffn2_weights[i],
+                self.ffn1_biases[i],
+                self.ffn1_weights_scale[i],
+                self.ffn2_biases[i],
+                self.ffn2_weights_scale[i],
+                self.quant_type,
+                self.config.moe_config.top_k,
+                self.config.moe_config.norm_topk_prob,
+            )
         return fused_moe_out
 
     def compute_ffn1(self, tmp_out, i):
