@@ -277,7 +277,7 @@ class DeepseekV2BlockInferenceModel(DeepseekV2PretrainedModel):
             topk_group=self.config.topk_group,
             norm_topk_prob=self.config.norm_topk_prob,
             routed_scaling_factor=self.config.routed_scaling_factor,
-            n_group=self.config.n_group,
+            num_expert_group=self.config.n_group,
             topk_method=self.config.topk_method,
             moe_intermediate_size=self.config.moe_intermediate_size,
             first_k_dense_replace=self.first_k_dense_replace,
