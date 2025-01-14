@@ -112,7 +112,7 @@ class MoeConfig:
     num_experts: int = 0
     top_k: int = 0
     topk_method: Optional[str] = None
-    n_group: int = 0
+    num_expert_group: int = 0
     topk_group: Optional[int] = None
     norm_topk_prob: bool = True
     moe_every2: bool = False
@@ -334,7 +334,7 @@ def get_moe_scores(
 ) -> paddle.Tensor:
 
     num_token = gating_output.shape[0]
-    num_expert_group = config.n_group
+    num_expert_group = config.num_expert_group
     topk_group = config.topk_group
 
     # Compute softmax or sigmoid scores based on the topk_method
@@ -344,14 +344,14 @@ def get_moe_scores(
 
     if config.topk_method == "group_limited_greedy":
         scores = paddle.nn.functional.softmax(gating_output, axis=-1)
-        group_scores = scores.reshape([num_token, num_expert_group, -1]).max(axis=-1)  # [n, n_group]
+        group_scores = scores.reshape([num_token, num_expert_group, -1]).max(axis=-1)  # [n, num_expert_group]
     elif config.topk_method == "noaux_tc":
         if e_score_correction_bias is None:
             raise ValueError("e_score_correction_bias must be provided for 'noaux_tc' method.")
         scores = paddle.nn.functional.sigmoid(gating_output) + e_score_correction_bias.unsqueeze(0)
         group_scores = (
             scores.reshape([num_token, num_expert_group, -1]).topk(2, axis=-1)[0].sum(axis=-1)
-        )  # [n, n_group]
+        )  # [n, num_expert_group]
     else:
         raise ValueError(
             f"Unsupported topk_method: {config.topk_method}. Please choose 'group_limited_greedy' or 'noaux_tc'."
@@ -360,7 +360,7 @@ def get_moe_scores(
     # Identify top-k groups
     group_idx = paddle.topk(group_scores, k=topk_group, axis=-1, sorted=False)[1]  # [n, topk_group]
 
-    group_mask = paddle.zeros_like(group_scores, dtype="int64")  # [n, n_group]
+    group_mask = paddle.zeros_like(group_scores, dtype="int64")  # [n, num_expert_group]
     group_mask.put_along_axis_(group_idx, 1, axis=1)
 
     # Apply group mask to the scores
