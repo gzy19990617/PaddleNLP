@@ -1109,7 +1109,7 @@ class FusedMultiTransformerBase(Layer):
         return tmp_out, residual_input
 
     def compute_fused_moe(self, tmp_out, i):
-        if self.config.topk_method:
+        if self.config.moe_config.topk_method:
             gate_out = paddle.matmul(tmp_out.cast("float32"), self.gate_weights[i])
             # 应用各种策略后重塑的scores
             scores = get_moe_scores(gate_out, self.config.moe_config, self.e_score_correction_biases[i])
@@ -1605,7 +1605,7 @@ class FusedMultiTransformerWeightOnly(FusedMultiTransformerBase):
         )
 
     def compute_fused_moe(self, tmp_out, i):
-        if self.config.topk_method:
+        if self.config.moe_config.topk_method:
             gate_out = paddle.matmul(tmp_out.cast("float32"), self.gate_weights[i])
             # 应用各种策略后重塑的scores
             scores = get_moe_scores(gate_out, self.config.moe_config, self.e_score_correction_biases[i])
