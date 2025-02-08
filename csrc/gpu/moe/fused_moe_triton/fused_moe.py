@@ -460,8 +460,8 @@ def invoke_fused_moe_kernel(
     A,
     B,
     C,  # out
-    A_scale,
-    B_scale,
+    A_scale, #a1_scale
+    B_scale, # w1_sacle
     topk_weights,
     topk_ids,
     sorted_token_ids,
@@ -478,9 +478,12 @@ def invoke_fused_moe_kernel(
     padded_size = 0
 
     if use_fp8_w8a8:
-        block_n, block_k = block_shape[0], block_shape[1]
-        # (TODO:后面使用凯伦算子代替)
-        A, A_scale = per_token_group_quant_fp8(A, block_k)
+        if block_shape is None:
+            print("not supoort now , will support soon!")
+        else:
+            block_n, block_k = block_shape[0], block_shape[1]
+            # (TODO:后面使用凯伦算子代替)
+            A, A_scale = per_token_group_quant_fp8(A, block_k)
 
     grid = lambda META: (
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"]) * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
@@ -799,7 +802,7 @@ def fused_moe(
     hidden_states,
     w1,
     w2,
-    gating_output,
+    scores,
     topk: int,
     renormalize: bool,
     use_fp8_w8a8: bool = False,
@@ -809,18 +812,18 @@ def fused_moe(
     a1_scale=None,
     a2_scale=None,
     block_shape: Optional[List[int]] = None,
+    refactor: float = 1.0,
 ):
     # Check constraints.
-    assert gating_output.shape[1] == w1.shape[0], "Number of experts mismatch"
+    assert scores.shape[1] == w1.shape[0], "Number of experts mismatch"
 
-    # fake
-    scores = paddle.nn.functional.softmax(gating_output, axis=-1)
+    # 经过分组策略后的scores计算topk
     topk_weights, topk_ids = paddle.topk(scores, k=topk, axis=-1, sorted=False)
-    # 记得renormalize和refactor
+    # renormalize和refactor
     if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    refacotr = 1.0
-    topk_weights = topk_weights * refacotr
+        topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdim=True)
+    
+    topk_weights = topk_weights * refactor
 
     return fused_experts_impl(
         hidden_states,

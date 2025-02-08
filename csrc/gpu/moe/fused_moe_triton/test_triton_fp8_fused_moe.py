@@ -90,43 +90,44 @@ def moe_fp8(i):
         w2_fp8,
         score,
         topk,
-        renormalize=False,
+        renormalize=True,
         use_fp8_w8a8=True,
         w1_scale=w1_s,
         w2_scale=w2_s,
         block_shape=block_size,
+        refactor=2.0,
     )
     paddle.device.synchronize()
     end = time.time()
     print(f"fp8 {i} : {((end - start) * 1000)} ms")
 
 
-def moe_fp8_no_block(i):
-    """Function to test FP8 per-tensor fused MoE."""
-    paddle.device.synchronize()
-    start = time.time()
-    out = fused_moe(
-        a,
-        w1_fp8,
-        w2_fp8,
-        score,
-        topk,
-        renormalize=False,
-        use_fp8_w8a8=True,
-        w1_scale=w1_s.reshape([E, -1]),
-        w2_scale=w2_s.reshape([E, -1]),
-    )
-    paddle.device.synchronize()
-    end = time.time()
-    print(f"fp8 no block {i} : {((end - start) * 1000)} ms")
+# def moe_fp8_no_block(i):
+#     """Function to test FP8 per-tensor fused MoE."""
+#     paddle.device.synchronize()
+#     start = time.time()
+#     out = fused_moe(
+#         a,
+#         w1_fp8,
+#         w2_fp8,
+#         score,
+#         topk,
+#         renormalize=True,
+#         use_fp8_w8a8=True,
+#         w1_scale=w1_s.reshape([E, -1]),
+#         w2_scale=w2_s.reshape([E, -1]),
+#     )
+#     paddle.device.synchronize()
+#     end = time.time()
+#     print(f"fp8 no block {i} : {((end - start) * 1000)} ms")
 
 
 # Run tests
-for i in range(10):
-    moe(i)
+# for i in range(10):
+#     moe(i)
 
 for i in range(10):
     moe_fp8(i)
 
-for i in range(10):
-    moe_fp8_no_block(i)
+# for i in range(10):
+#     moe_fp8_no_block(i)
