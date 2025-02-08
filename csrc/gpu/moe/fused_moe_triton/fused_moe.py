@@ -455,6 +455,13 @@ def moe_align_block_size(topk_ids, block_size: int, num_experts: int):
     )
     return sorted_ids, expert_ids, num_tokens_post_pad
 
+# 初步实现，后期可以换成cuda kernel，实现动态or静态
+def per_tensor_quant_fp8(x, scale=None):
+    x_fp32 = x.cast("float32")
+    x_s = x_fp32.abs().max().clip(min=0.000001) / 448.0
+    x_q = x_fp32 / x_s
+    x_q = x_q.clip(min=-448.0, max=448.0)
+    return x_q.cast("float8_e4m3fn"), x_s
 
 def invoke_fused_moe_kernel(
     A,
@@ -476,10 +483,9 @@ def invoke_fused_moe_kernel(
     block_shape: Optional[List[int]] = None,
 ) -> None:
     padded_size = 0
-
     if use_fp8_w8a8:
         if block_shape is None:
-            print("not supoort now , will support soon!")
+            A, A_scale = per_tensor_quant_fp8(A, A_scale)
         else:
             block_n, block_k = block_shape[0], block_shape[1]
             # (TODO:后面使用凯伦算子代替)

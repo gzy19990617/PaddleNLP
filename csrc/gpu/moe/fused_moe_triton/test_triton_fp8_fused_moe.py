@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# export PYTHONPATH=$PYTHONPATH:/home/gaoziyuan/PaddleNLP
+
 import functools
 import json
 import logging
@@ -22,7 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import paddle
 import triton
 import triton.language as tl
-from fused_moe import fused_moe
+from csrc.gpu.moe.fused_moe_triton import fused_moe
 
 # Constants
 DTYPES = paddle.bfloat16
@@ -102,24 +104,25 @@ def moe_fp8(i):
     print(f"fp8 {i} : {((end - start) * 1000)} ms")
 
 
-# def moe_fp8_no_block(i):
-#     """Function to test FP8 per-tensor fused MoE."""
-#     paddle.device.synchronize()
-#     start = time.time()
-#     out = fused_moe(
-#         a,
-#         w1_fp8,
-#         w2_fp8,
-#         score,
-#         topk,
-#         renormalize=True,
-#         use_fp8_w8a8=True,
-#         w1_scale=w1_s.reshape([E, -1]),
-#         w2_scale=w2_s.reshape([E, -1]),
-#     )
-#     paddle.device.synchronize()
-#     end = time.time()
-#     print(f"fp8 no block {i} : {((end - start) * 1000)} ms")
+def moe_fp8_no_block(i):
+    """Function to test FP8 per-tensor fused MoE."""
+    paddle.device.synchronize()
+    start = time.time()
+
+    out = fused_moe(
+        a, # bf16
+        w1_fp8,
+        w2_fp8,
+        score,
+        topk,
+        renormalize=True,
+        use_fp8_w8a8=True,
+        w1_scale=w1_s.reshape([E, -1]),
+        w2_scale=w2_s.reshape([E, -1]),
+    )
+    paddle.device.synchronize()
+    end = time.time()
+    print(f"fp8 no block {i} : {((end - start) * 1000)} ms")
 
 
 # Run tests
@@ -129,5 +132,5 @@ def moe_fp8(i):
 for i in range(10):
     moe_fp8(i)
 
-# for i in range(10):
-#     moe_fp8_no_block(i)
+for i in range(10):
+    moe_fp8_no_block(i)

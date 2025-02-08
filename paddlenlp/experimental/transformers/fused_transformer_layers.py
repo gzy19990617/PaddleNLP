@@ -1203,43 +1203,65 @@ class FusedMultiTransformerBase(Layer):
 
             return scores
 
+        
+            gate_out = paddle.matmul(tmp_out.cast("float32"), self.gate_weights[i])
+            # 应用各种策略后重塑的scores
+            scores = get_moe_scores(gate_out, self.config.moe_config, self.e_score_correction_biases[i])
+
+
+        
         if self.config.moe_config.topk_method is not None:
             gate_out = paddle.matmul(tmp_out.cast("float32"), self.gate_weights[i])
             # 应用各种策略后重塑的scores
             scores = get_moe_scores(gate_out, self.config.moe_config, self.e_score_correction_biases[i])
-            # topk在moe_dispatch中
-            (
-                permute_input,
-                token_nums_per_expert,
-                permute_indices_per_token,
-                expert_scales_float,
-                top_k_indices,
-            ) = moe_dispatch(tmp_out, scores, self.config.moe_config.top_k, False, topk_only_mode=True)
+            
+            # TODO:使用trition fp8算子,此处可以按需修改
+            use_fp8 = False
+            if use_fp8:
+                from csrc.gpu.moe.fused_moe_triton import fused_moe
+                fused_moe_out = fused_moe(
+                    a,
+                    w1_fp8, # 第一个weight
+                    w2_fp8, # 第二个weight
+                    scores,
+                    self.config.moe_config.top_k,
+                    renormalize=self.config.moe_config.norm_topk_prob,
+                    use_fp8_w8a8=True,
+                    w1_scale=w1_s, # 第一个weight的sacle,如果是block-wise，应该是三维的
+                    w2_scale=w2_s, # 第二个weight的sacle,如果是block-wise，应该是三维的
+                    block_shape=block_size, # block-wise， 如果是per-tensor量化，此处删掉就可以
+                    refactor=self.config.moe_config.routed_scaling_factor,
+                )
+            else:
+                # topk在moe_dispatch中
+                (
+                    permute_input,
+                    token_nums_per_expert,
+                    permute_indices_per_token,
+                    expert_scales_float,
+                    top_k_indices,
+                ) = moe_dispatch(tmp_out, scores, self.config.moe_config.top_k, False, topk_only_mode=True)
 
-            ffn_out = moe_ffn(
-                permute_input,
-                token_nums_per_expert,
-                self.ffn1_weights[i],
-                self.ffn2_weights[i],
-                self.ffn1_biases[i],
-                self.ffn1_weights_scale[i] if hasattr(self, "ffn1_weights_scale") else None,
-                self.ffn2_weights_scale[i] if hasattr(self, "ffn2_weights_scale") else None,
-                self.quant_type if hasattr(self, "quant_type") else "None",
-            )
+                ffn_out = moe_ffn(
+                    permute_input,
+                    token_nums_per_expert,
+                    self.ffn1_weights[i],
+                    self.ffn2_weights[i],
+                    self.ffn1_biases[i],
+                    self.ffn1_weights_scale[i] if hasattr(self, "ffn1_weights_scale") else None,
+                    self.ffn2_weights_scale[i] if hasattr(self, "ffn2_weights_scale") else None,
+                    self.quant_type if hasattr(self, "quant_type") else "None",
+                )
 
-            # ffn1_biases要拆分tp的各个卡上，或者只在0卡上，省略此处reduce，减少一次reduce
-            if self.nranks > 1:
-                dist.all_reduce(ffn_out)
-
-            fused_moe_out = moe_reduce(
-                ffn_out,
-                expert_scales_float,
-                permute_indices_per_token,
-                top_k_indices,
-                self.ffn2_biases[i],
-                norm_topk_prob=self.config.moe_config.norm_topk_prob,
-                routed_scaling_factor=self.config.moe_config.routed_scaling_factor,  # reduce中会做topk个weight的norm和routed_scaling_factor
-            )
+                fused_moe_out = moe_reduce(
+                    ffn_out,
+                    expert_scales_float,
+                    permute_indices_per_token,
+                    top_k_indices,
+                    self.ffn2_biases[i],
+                    norm_topk_prob=self.config.moe_config.norm_topk_prob,
+                    routed_scaling_factor=self.config.moe_config.routed_scaling_factor,  # reduce中会做topk个weight的norm和routed_scaling_factor
+                )
         else:
             fused_moe_out = fused_moe(
                 tmp_out,
