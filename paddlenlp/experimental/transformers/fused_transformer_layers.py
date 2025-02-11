@@ -1209,12 +1209,12 @@ class FusedMultiTransformerBase(Layer):
                 topk_weights = original_scores.gather(topk_ids, 1)
 
             # renormalize和refactor在后面做
-            return topk_weights, topk_ids
+            return topk_weights, topk_ids, tmp_scores
 
         if self.config.moe_config.topk_method is not None:
             gate_out = paddle.matmul(tmp_out.cast("float32"), self.gate_weights[i])
             # 应用各种策略后重塑的scores
-            topk_weights, top_k_indices = get_moe_scores(gate_out, self.config.moe_config, self.e_score_correction_biases[i])
+            topk_weights, top_k_indices, scores= get_moe_scores(gate_out, self.config.moe_config, self.e_score_correction_biases[i])
             
             # TODO:使用trition fp8算子,此处可以按需修改
             # use_fp8 = False
