@@ -1158,7 +1158,7 @@ class FusedMultiTransformerBase(Layer):
             gating_output: paddle.Tensor,
             config: MoeConfig,
             e_score_correction_bias: Optional[paddle.Tensor] = None,
-        ) -> paddle.Tensor:
+        ):
 
             num_token = gating_output.shape[0]
             num_expert_group = config.num_expert_group
