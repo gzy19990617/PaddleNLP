@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include <cuda_runtime_api.h>
 #include <NvInferRuntime.h>
 #include <optional>
@@ -164,13 +165,33 @@ struct QuantParams
     }
 };
 
+struct BlockScaleParams
+{
+    using BlockScaleGemmImplPtr = std::shared_ptr<kernels::small_m_gemm::CutlassFp8BlockScaleGemmRunnerInterface>;
+    BlockScaleGemmImplPtr blockscale_gemm_iml;
+    float const* fc1_scales_ptrs = nullptr;
+    float const* fc2_scales_ptrs = nullptr;
+    char* workspace;
+    cudaEvent_t* memcpy_event_ptr;
+    BlockScaleParams() = default;
+    BlockScaleParams(float const* fc1_scales_ptrs, float const* fc2_scales_ptrs,
+        BlockScaleGemmImplPtr blockscale_gemm_iml, char* workspace, cudaEvent_t* memcpy_event_ptr)
+        : fc1_scales_ptrs(fc1_scales_ptrs)
+        , fc2_scales_ptrs(fc2_scales_ptrs)
+        , blockscale_gemm_iml(blockscale_gemm_iml)
+        , workspace(workspace)
+        , memcpy_event_ptr(memcpy_event_ptr)
+    {
+    }
+};
+
 class CutlassMoeFCRunnerInterface
 {
 public:
     virtual ~CutlassMoeFCRunnerInterface() = default;
     virtual size_t getWorkspaceSize(int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
         int const num_experts, int const k, ActivationType activation_type, MOEExpertScaleNormalizationMode norm_mode,
-        MOEParallelismConfig parallelism_config) const = 0;
+        MOEParallelismConfig parallelism_config, bool use_deepseek) const = 0;
     virtual void setTactic(std::optional<cutlass_extensions::CutlassGemmConfig> gemm1_config,
         std::optional<cutlass_extensions::CutlassGemmConfig> gemm2_config) = 0;
     virtual std::vector<cutlass_extensions::CutlassGemmConfig> getTactics() = 0;
@@ -181,7 +202,7 @@ public:
         int64_t const inter_size, int const num_experts, int const k, char* workspace_ptr, void* final_output,
         bool const* finished, int64_t const active_rows, void* token_topk_unpermuted_scales,
         int* expanded_source_row_to_expanded_dest_row, int* expert_for_source_row, float sparse_mixer_epsilon,
-        MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode,
+        MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode, bool use_deepseek, BlockScaleParams& deepseek_params,
         cudaStream_t stream) = 0;
 
     virtual void gemm1(void const* const input, void* const output, void* const intermediate_result,
@@ -239,7 +260,7 @@ public:
 
     size_t getWorkspaceSize(int64_t const num_rows, int64_t const hidden_size, int64_t const fc1_output_size,
         int const num_experts, int const k, ActivationType activation_type, MOEExpertScaleNormalizationMode norm_mode,
-        MOEParallelismConfig parallelism_config) const override;
+        MOEParallelismConfig parallelism_config, bool use_deepseek) const override;
 
     void setTactic(std::optional<cutlass_extensions::CutlassGemmConfig> gemm1_config,
         std::optional<cutlass_extensions::CutlassGemmConfig> gemm2_config) override
@@ -265,7 +286,7 @@ public:
         int64_t const inter_size, int const num_experts, int const k, char* workspace_ptr, void* final_output,
         bool const* finished, int64_t const active_rows, void* token_topk_unpermuted_scales,
         int* expanded_source_row_to_expanded_dest_row, int* expert_for_source_row, float sparse_mixer_epsilon,
-        MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode,
+        MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode, bool use_deepseek, BlockScaleParams& deepseek_params,
         cudaStream_t stream) override;
 
     static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner, T const* const input,
@@ -339,10 +360,10 @@ private:
         cudaStream_t stream);
     std::vector<size_t> getWorkspaceDeviceBufferSizes(int64_t const num_rows, int64_t const hidden_size,
         int64_t const inter_size, int const num_experts, int const num_experts_per_node, int const k,
-        ActivationType activation_type, MOEExpertScaleNormalizationMode norm_mode) const;
+        ActivationType activation_type, MOEExpertScaleNormalizationMode norm_mode, bool use_deepseek) const;
     void configureWsPtrs(char* ws_ptr, int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
         int const num_experts, int const num_experts_per_node, int const k, ActivationType activation_type,
-        MOEExpertScaleNormalizationMode norm_mode);
+        MOEExpertScaleNormalizationMode norm_mode, bool use_deepseek);
 
 private:
     bool mayHaveDifferentGEMMOutputType() const
@@ -355,6 +376,20 @@ private:
     {
         return moe_gemm_runner_.supportsHopperSpecialisation() && !use_deterministic_hopper_reduce_;
     }
+    void BlockScaleFC1(T const* const input, T* const output, void* const intermediate_result,
+        int64_t const* const expert_first_token_offset, WeightType const* const fc1_expert_weights,
+        ScaleBiasType const* const fc1_expert_biases, float const* const fc2_fp8_quant, int64_t const expanded_num_rows,
+        int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
+        ActivationType fc1_activation_type, BlockScaleParams& deepseek_params, cudaStream_t stream);
+
+    void BlockScaleFC2(T const* const input, void* const gemm_output, OutputType* const final_output,
+        int64_t const* const expert_first_token_offset, WeightType const* const fc2_expert_weights,
+        ScaleBiasType const* const fc2_expert_biases, float const* const token_topk_unpermuted_scales,
+        int const* const expanded_source_row_to_expanded_dest_row, int const* const expert_for_source_row,
+        int64_t const* const num_valid_tokens_ptr, int64_t const num_rows,
+        int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const inter_size,
+        int const num_experts_per_node, int64_t const k, BlockScaleParams& deepseek_params, cudaStream_t stream,
+        MOEParallelismConfig parallelism_config);
 
     CubKeyValueSorter sorter_;
     MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType> moe_gemm_runner_;
@@ -380,10 +415,16 @@ private:
     float const** alpha_scale_ptr_array_ = nullptr;
 
     HopperGroupedGemmInput hopper_grouped_gemm_input_;
+    struct HostDeepSeekWorkspace
+    {
+        std::vector<int64_t> host_expert_first_token_offset;
+        std::vector<int> host_num_tokens_per_expert;
+    };
+    HostDeepSeekWorkspace host_deepseek_workspace_;
 };
 
-void makeLoadBalancedRoutingConfiguration(
-    void* data_void, int num_experts, int num_tokens, int k, nvinfer1::DataType type, cudaStream_t stream);
+// void makeLoadBalancedRoutingConfiguration(
+//     void* data_void, int num_experts, int num_tokens, int k, nvinfer1::DataType type, cudaStream_t stream);
 
 struct GemmProfilerBackend
 {

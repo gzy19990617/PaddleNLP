@@ -1304,7 +1304,7 @@ template <class T, class WeightType, class OutputType, class ScaleBiasType, clas
 std::vector<size_t> CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::getWorkspaceDeviceBufferSizes(
     int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size, int const num_experts,
     int const num_experts_per_node, int const k, ActivationType activation_type,
-    MOEExpertScaleNormalizationMode norm_mode) const
+    MOEExpertScaleNormalizationMode norm_mode, bool use_deepseek) const
 {
     size_t const num_moe_inputs = k * num_rows;
     size_t const permuted_elems = num_moe_inputs * hidden_size;
@@ -1377,15 +1377,23 @@ std::vector<size_t> CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType,
         overlapped_gemm1_gemm2_outputs
             = std::max(std::max(glu_inter_size, fc2_result_size), overlapped_gemm1_gemm2_outputs);
     }
-
-    std::vector<size_t> workspace{source_rows_size, //
-        permuted_rows_size,                         //
-        permuted_experts_size,                      //
-        expert_first_token_offset_size,             //
-        sparse_mixer_out_size,                      //
-        softmax_out_size,                           //
-        permuted_scales_size,                       //
-        sorter_size,                                //
+    if (use_deepseek)
+    {
+        int factor = is_gated_activation ? 2 : 1;
+        int blockscale_fc1_output_size = factor * interbuf_elems * gemm_output_dtype;
+        int blockscale_fc2_output_size = permuted_elems * gemm_output_dtype;
+        overlapped_gemm1_gemm2_inputs = std::max(permuted_data_size, fc1_result_size);
+        overlapped_gemm1_gemm2_outputs = std::max(blockscale_fc1_output_size, blockscale_fc2_output_size);
+    }
+    std::vector<size_t> workspace{
+        source_rows_size,               //
+        permuted_rows_size,             //
+        permuted_experts_size,          //
+        expert_first_token_offset_size, //
+        sparse_mixer_out_size,          //
+        softmax_out_size,               //
+        permuted_scales_size,           //
+        sorter_size,                    //
         // These pointers reuse the same memory
         overlapped_gemm1_gemm2_inputs,  //
         overlapped_gemm1_gemm2_outputs, //
@@ -1399,13 +1407,13 @@ std::vector<size_t> CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType,
 template <class T, class WeightType, class OutputType, class ScaleBiasType, class Enable>
 size_t CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::getWorkspaceSize(int64_t const num_rows,
     int64_t const hidden_size, int64_t const inter_size, int const num_experts, int const k,
-    ActivationType activation_type, MOEExpertScaleNormalizationMode norm_mode, MOEParallelismConfig parallelism_config
+    ActivationType activation_type, MOEExpertScaleNormalizationMode norm_mode, MOEParallelismConfig parallelism_config, bool use_deepseek
     ) const
 {
     int const ep_size = parallelism_config.ep_size;
     TLLM_CHECK_WITH_INFO(num_experts % ep_size == 0, "Number of experts must be a multiple of ep size");
-    auto workspace = getWorkspaceDeviceBufferSizes(
-        num_rows, hidden_size, inter_size, num_experts, num_experts / ep_size, k, activation_type, norm_mode);
+    auto workspace = getWorkspaceDeviceBufferSizes(num_rows, hidden_size, inter_size, num_experts,
+        num_experts / ep_size, k, activation_type, norm_mode, use_deepseek);
     auto ws_size = tensorrt_llm::common::calculateTotalWorkspaceSize(workspace.data(), workspace.size());
     TLLM_LOG_DEBUG("Mixture Of Experts Plugin requires workspace of %2f MiB", ws_size / 1024.f / 1024.f);
     return ws_size;
@@ -1415,11 +1423,11 @@ template <class T, class WeightType, class OutputType, class ScaleBiasType, clas
 void CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::configureWsPtrs(char* ws_ptr,
     int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size, int const num_experts,
     int const num_experts_per_node, int const k, ActivationType activation_type,
-    MOEExpertScaleNormalizationMode norm_mode)
+    MOEExpertScaleNormalizationMode norm_mode, bool use_deepseek)
 
 {
-    auto ws_sizes = getWorkspaceDeviceBufferSizes(
-        num_rows, hidden_size, inter_size, num_experts, num_experts_per_node, k, activation_type, norm_mode);
+    auto ws_sizes = getWorkspaceDeviceBufferSizes(num_rows, hidden_size, inter_size, num_experts, num_experts_per_node,
+        k, activation_type, norm_mode, use_deepseek);
 
     std::vector<int8_t*> ws_sliced{(int8_t*) ws_ptr};
     for (auto size : ws_sizes)
@@ -1479,6 +1487,67 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::confi
     {
         hopper_grouped_gemm_input_.configureWorkspace(ws_sliced[11], num_experts_per_node, ws_sliced[12], ws_sizes[12]);
     }
+
+    if (use_deepseek)
+    {
+        permuted_data_ = (T*) ws_sliced[8];
+        fc1_result_ = (T*) ws_sliced[8];
+        glu_inter_result_ = (T*) ws_sliced[9];
+        fc2_result_ = (T*) ws_sliced[9];
+    }
+}
+
+template <class T, class WeightType, class OutputType, class ScaleBiasType, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::BlockScaleFC1(T const* const input,
+    T* const output, void* const gemm_output, int64_t const* const expert_first_token_offset,
+    WeightType const* const fc1_expert_weights, ScaleBiasType const* const fc1_expert_biases,
+    float const* const fc2_fp8_quant, int64_t const expanded_num_rows, int64_t const hidden_size,
+    int64_t const inter_size, int const num_experts_per_node, ActivationType fc1_activation_type,
+    BlockScaleParams& deepseek_params, cudaStream_t stream)
+{
+    auto gemm_runner = deepseek_params.blockscale_gemm_iml;
+    TLLM_CHECK_WITH_INFO(gemm_runner, "blockscale gemm runner must be instantiated");
+    bool const is_gated_activation = isGatedActivation(fc1_activation_type);
+
+    int shape_n = is_gated_activation ? inter_size * 2 : inter_size;
+    int shape_k = hidden_size;
+
+    gemm_runner->moeGemm(gemm_output, input, fc1_expert_weights, expert_first_token_offset, num_experts_per_node,
+        shape_n, shape_k, deepseek_params.workspace, stream, nullptr, deepseek_params.fc1_scales_ptrs);
+
+    sync_check_cuda_error();
+    constexpr bool bias_is_broadcast = true;
+    doActivation<T, UnfusedGemmOutputType>(output, static_cast<UnfusedGemmOutputType const*>(gemm_output),
+        fc2_fp8_quant, fc1_expert_biases, bias_is_broadcast, expert_first_token_offset, num_experts_per_node,
+        inter_size, expanded_num_rows, fc1_activation_type, stream);
+
+    sync_check_cuda_error();
+    std::cout <<"fp8 gemm 1 done" << std::endl;
+}
+
+template <class T, class WeightType, class OutputType, class ScaleBiasType, class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::BlockScaleFC2(T const* const input,
+    void* const gemm_output, OutputType* const final_output, int64_t const* const expert_first_token_offset,
+    WeightType const* const fc2_expert_weights, ScaleBiasType const* const fc2_expert_biases,
+    float const* const token_topk_unpermuted_scales, int const* const expanded_source_row_to_expanded_dest_row,
+    int const* const expert_for_source_row, int64_t const* const num_valid_tokens_ptr, int64_t const num_rows,
+    int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const inter_size,
+    int const num_experts_per_node, int64_t const k, BlockScaleParams& deepseek_params, cudaStream_t stream,
+    MOEParallelismConfig parallelism_config)
+{
+    int shape_n = hidden_size;
+    int shape_k = inter_size;
+    auto gemm_runner = deepseek_params.blockscale_gemm_iml;
+    TLLM_CHECK_WITH_INFO(gemm_runner, "blockscale gemm runner must be instantiated");
+    gemm_runner->moeGemm(gemm_output, input, fc2_expert_weights, expert_first_token_offset, num_experts_per_node,
+        shape_n, shape_k, deepseek_params.workspace, stream, nullptr, deepseek_params.fc2_scales_ptrs);
+
+    sync_check_cuda_error();
+
+    finalizeMoeRoutingKernelLauncher<T, OutputType, UnfusedGemmOutputType>(
+        static_cast<UnfusedGemmOutputType const*>(gemm_output), final_output, fc2_expert_biases,
+        token_topk_unpermuted_scales, expanded_source_row_to_expanded_dest_row, expert_for_source_row, num_rows,
+        hidden_size, k, num_valid_tokens_ptr, parallelism_config, MOEExpertScaleNormalizationMode::NONE, stream);
 }
 
 void sortAndScanSoftmaxOutput(int* expert_for_source_row, int* source_rows, int* permuted_experts, int* permuted_rows,
@@ -1680,7 +1749,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::runMo
     int const num_experts, int const k, char* workspace_ptr, void* final_output_void, bool const* finished,
     int64_t const active_rows, void* token_topk_final_scales_void, int* expanded_source_row_to_expanded_dest_row,
     int* expert_for_source_row, float sparse_mixer_epsilon, MOEParallelismConfig parallelism_config,
-    MOEExpertScaleNormalizationMode normalization_mode, cudaStream_t stream)
+    MOEExpertScaleNormalizationMode normalization_mode, bool use_deepseek, BlockScaleParams& deepseek_params, cudaStream_t stream)
 {
     static constexpr bool int_scales_required
         = std::is_same<WeightType, uint8_t>::value || std::is_same<WeightType, cutlass::uint4b_t>::value;
@@ -1740,7 +1809,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::runMo
         TLLM_CHECK_WITH_INFO(fc1_fp8_dequant == nullptr && fc2_fp8_quant == nullptr && fc2_fp8_dequant == nullptr,
             "FP8 scales are provided for integer quantization");
     }
-    else if (fp8_scales_required)
+    else if (fp8_scales_required && (!use_deepseek))
     {
         TLLM_CHECK_WITH_INFO(fc1_expert_biases == nullptr, "Bias is not supported with FP8");
         TLLM_CHECK_WITH_INFO(fc2_expert_biases == nullptr, "Bias is not supported with FP8");
@@ -1771,7 +1840,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::runMo
     int const num_experts_per_node = num_experts / parallelism_config.ep_size;
 
     configureWsPtrs(workspace_ptr, num_rows, hidden_size, inter_size, num_experts, num_experts_per_node, k,
-        fc1_activation_type, normalization_mode);
+        fc1_activation_type, normalization_mode, use_deepseek);
 
     int const start_expert = num_experts_per_node * parallelism_config.ep_rank;
     int const end_expert = start_expert + num_experts_per_node;
@@ -1798,22 +1867,41 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::runMo
         permuted_rows_, expanded_source_row_to_expanded_dest_row, num_rows, num_valid_tokens_ptr, hidden_size, k,
         stream);
 
-    // sync_check_cuda_error();
+    sync_check_cuda_error();
 
-    Self::gemm1(moe_gemm_runner_, permuted_data_, fc1_result_, glu_inter_result_, expert_first_token_offset_,
-        hopper_grouped_gemm_input_, fc1_expert_weights, fc1_expert_biases, num_valid_tokens_ptr, fc1_int_scales,
-        fc1_fp8_dequant, fc2_fp8_quant, expanded_num_rows, hidden_size, inter_size, num_experts_per_node,
-        fc1_activation_type, alpha_scale_ptr_array_, true, stream, *gemm1_config_);
+    if (use_deepseek)
+    {
+        BlockScaleFC1(permuted_data_, fc1_result_, glu_inter_result_, expert_first_token_offset_, fc1_expert_weights,
+            fc1_expert_biases, fc2_fp8_quant, expanded_num_rows, hidden_size, inter_size, num_experts_per_node,
+            fc1_activation_type, deepseek_params, stream);
+    }
+    else
+    {
+        Self::gemm1(moe_gemm_runner_, permuted_data_, fc1_result_, glu_inter_result_, expert_first_token_offset_,
+            hopper_grouped_gemm_input_, fc1_expert_weights, fc1_expert_biases, num_valid_tokens_ptr, fc1_int_scales,
+            fc1_fp8_dequant, fc2_fp8_quant, expanded_num_rows, hidden_size, inter_size, num_experts_per_node,
+            fc1_activation_type, alpha_scale_ptr_array_, true, stream, *gemm1_config_);
+    }
 
-    // sync_check_cuda_error();
+    sync_check_cuda_error();
 
-    Self::gemm2(moe_gemm_runner_, fc1_result_, fc2_result_, final_output, expert_first_token_offset_,
-        hopper_grouped_gemm_input_, fc2_expert_weights, fc2_expert_biases, fc2_int_scales, fc2_fp8_dequant,
-        token_topk_unpermuted_scales, permuted_scales_, expanded_source_row_to_expanded_dest_row, permuted_rows_,
-        expert_for_source_row, num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, inter_size,
-        num_experts_per_node, k, !use_deterministic_hopper_reduce_, alpha_scale_ptr_array_, stream, parallelism_config, *gemm2_config_);
 
-    // sync_check_cuda_error();
+    if (use_deepseek)
+    {
+        BlockScaleFC2(fc1_result_, fc2_result_, final_output, expert_first_token_offset_, fc2_expert_weights,
+            fc2_expert_biases, token_topk_unpermuted_scales, expanded_source_row_to_expanded_dest_row,
+            expert_for_source_row, num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, inter_size,
+            num_experts_per_node, k, deepseek_params, stream, parallelism_config);
+    }
+    else
+    {
+        Self::gemm2(moe_gemm_runner_, fc1_result_, fc2_result_, final_output, expert_first_token_offset_,
+            hopper_grouped_gemm_input_, fc2_expert_weights, fc2_expert_biases, fc2_int_scales, fc2_fp8_dequant,
+            token_topk_unpermuted_scales, permuted_scales_, expanded_source_row_to_expanded_dest_row, permuted_rows_,
+            expert_for_source_row, num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, inter_size,
+            num_experts_per_node, k, !use_deterministic_hopper_reduce_, alpha_scale_ptr_array_, stream, parallelism_config, *gemm2_config_);
+    }
+    sync_check_cuda_error();
 }
 
 template <class T, class WeightType, class OutputType, class ScaleBiasType, class Enable>
@@ -1862,21 +1950,21 @@ __global__ void initRoutingKernelDiagonal(void* data_void, int num_experts, int 
     }
 }
 
-void makeLoadBalancedRoutingConfiguration(
-    void* data_void, int num_experts, int num_tokens, int k, nvinfer1::DataType type, cudaStream_t stream)
-{
-    TLLM_CHECK_WITH_INFO(type == nvinfer1::DataType::kFLOAT, "Routing configuration must be float");
-    check_cuda_error(
-        cudaMemsetAsync(data_void, 0x0, int64_t{num_experts} * int64_t{num_tokens} * sizeof(float), stream));
+// void makeLoadBalancedRoutingConfiguration(
+//     void* data_void, int num_experts, int num_tokens, int k, nvinfer1::DataType type, cudaStream_t stream)
+// {
+//     TLLM_CHECK_WITH_INFO(type == nvinfer1::DataType::kFLOAT, "Routing configuration must be float");
+//     check_cuda_error(
+//         cudaMemsetAsync(data_void, 0x0, int64_t{num_experts} * int64_t{num_tokens} * sizeof(float), stream));
 
-    int stride = tensorrt_llm::common::ceilDiv(num_experts, k);
+//     int stride = tensorrt_llm::common::ceilDiv(num_experts, k);
 
-    int blockDim = 256;
-    int gridDim = tensorrt_llm::common::ceilDiv(num_tokens, blockDim);
-    initRoutingKernelDiagonal<float><<<gridDim, blockDim, 0, stream>>>(data_void, num_experts, num_tokens, k, stride);
+//     int blockDim = 256;
+//     int gridDim = tensorrt_llm::common::ceilDiv(num_tokens, blockDim);
+//     initRoutingKernelDiagonal<float><<<gridDim, blockDim, 0, stream>>>(data_void, num_experts, num_tokens, k, stride);
 
-    sync_check_cuda_error();
-}
+//     sync_check_cuda_error();
+// }
 
 __global__ void prepareFakeRouterBuffers(int* unpermuted_source_rows, int* unpermuted_expert_selection,
     int64_t num_tokens, int64_t k, int64_t num_experts, int64_t num_experts_per_node)
@@ -1980,92 +2068,92 @@ void GemmProfilerBackend::prepare(int num_tokens, char* workspace, cudaStream_t 
     }
 }
 
-std::vector<size_t> GemmProfilerBackend::getProfilerWorkspaces(int maxM, bool is_hopper)
-{
-    size_t k = mK;
-    size_t num_expanded_tokens = maxM * k;
+// std::vector<size_t> GemmProfilerBackend::getProfilerWorkspaces(int maxM, bool is_hopper)
+// {
+//     size_t k = mK;
+//     size_t num_expanded_tokens = maxM * k;
 
-    size_t dtype_bytes = tensorrt_llm::common::getDTypeSize(mDType);
-    float weight_bytes
-        = mWType == nvinfer1::DataType::kINT4 ? 0.5f : static_cast<float>(tensorrt_llm::common::getDTypeSize(mWType));
-    size_t output_bytes = tensorrt_llm::common::getDTypeSize(mOType);
-    size_t gemm_output_bytes = (mOType == nvinfer1::DataType::kFP8)
-        ? sizeof(HopperGroupedGemmInput::OutputTypeAdaptor_t<__nv_fp8_e4m3>)
-        : output_bytes;
+//     size_t dtype_bytes = tensorrt_llm::common::getDTypeSize(mDType);
+//     float weight_bytes
+//         = mWType == nvinfer1::DataType::kINT4 ? 0.5f : static_cast<float>(tensorrt_llm::common::getDTypeSize(mWType));
+//     size_t output_bytes = tensorrt_llm::common::getDTypeSize(mOType);
+//     size_t gemm_output_bytes = (mOType == nvinfer1::DataType::kFP8)
+//         ? sizeof(HopperGroupedGemmInput::OutputTypeAdaptor_t<__nv_fp8_e4m3>)
+//         : output_bytes;
 
-    size_t hidden_size = mExpertHiddenSize;
-    size_t inter_size = mExpertInterSize; // Already divided by TP
-    size_t num_experts_per_node = mNumExpertsPerNode;
+//     size_t hidden_size = mExpertHiddenSize;
+//     size_t inter_size = mExpertInterSize; // Already divided by TP
+//     size_t num_experts_per_node = mNumExpertsPerNode;
 
-    size_t fc1_out_size = inter_size;
-    if (isGatedActivation(mActivationType))
-    {
-        fc1_out_size = inter_size * 2;
-    }
+//     size_t fc1_out_size = inter_size;
+//     if (isGatedActivation(mActivationType))
+//     {
+//         fc1_out_size = inter_size * 2;
+//     }
 
-    // TODO Needs updated when gather/finalize fusion is integrated
-    size_t input_size1 = hidden_size * num_expanded_tokens * dtype_bytes;
-    size_t output_size1 = inter_size * num_expanded_tokens * dtype_bytes;
+//     // TODO Needs updated when gather/finalize fusion is integrated
+//     size_t input_size1 = hidden_size * num_expanded_tokens * dtype_bytes;
+//     size_t output_size1 = inter_size * num_expanded_tokens * dtype_bytes;
 
-    size_t input_size2 = inter_size * num_expanded_tokens * dtype_bytes;
-    size_t output_size2 = hidden_size * output_bytes;
+//     size_t input_size2 = inter_size * num_expanded_tokens * dtype_bytes;
+//     size_t output_size2 = hidden_size * output_bytes;
 
-    size_t input_size = mGemmToProfile == GemmToProfile::GEMM_1 ? input_size1 : input_size2;
-    size_t output_size = mGemmToProfile == GemmToProfile::GEMM_1 ? output_size1 : output_size2;
+//     size_t input_size = mGemmToProfile == GemmToProfile::GEMM_1 ? input_size1 : input_size2;
+//     size_t output_size = mGemmToProfile == GemmToProfile::GEMM_1 ? output_size1 : output_size2;
 
-    // This may allocate a pointer when not required. That's fine it will be ignored at the cost of some memory
-    size_t intermediate_size1 = fc1_out_size * num_expanded_tokens * gemm_output_bytes; // Note gemm_output_bytes
-    size_t intermediate_size2 = hidden_size * num_expanded_tokens * gemm_output_bytes;  // Note gemm_output_bytes
+//     // This may allocate a pointer when not required. That's fine it will be ignored at the cost of some memory
+//     size_t intermediate_size1 = fc1_out_size * num_expanded_tokens * gemm_output_bytes; // Note gemm_output_bytes
+//     size_t intermediate_size2 = hidden_size * num_expanded_tokens * gemm_output_bytes;  // Note gemm_output_bytes
 
-    size_t intermediate_size = mGemmToProfile == GemmToProfile::GEMM_1 ? intermediate_size1 : intermediate_size2;
+//     size_t intermediate_size = mGemmToProfile == GemmToProfile::GEMM_1 ? intermediate_size1 : intermediate_size2;
 
-    size_t weights_1 = hidden_size * fc1_out_size * num_experts_per_node * weight_bytes;
-    size_t bias_1 = mBias ? fc1_out_size * num_experts_per_node * dtype_bytes : 0;
-    size_t weights_2 = hidden_size * inter_size * num_experts_per_node * weight_bytes;
-    size_t bias_2 = mBias ? hidden_size * num_experts_per_node * dtype_bytes : 0;
+//     size_t weights_1 = hidden_size * fc1_out_size * num_experts_per_node * weight_bytes;
+//     size_t bias_1 = mBias ? fc1_out_size * num_experts_per_node * dtype_bytes : 0;
+//     size_t weights_2 = hidden_size * inter_size * num_experts_per_node * weight_bytes;
+//     size_t bias_2 = mBias ? hidden_size * num_experts_per_node * dtype_bytes : 0;
 
-    size_t weights = mGemmToProfile == GemmToProfile::GEMM_1 ? weights_1 : weights_2;
-    size_t bias = mGemmToProfile == GemmToProfile::GEMM_1 ? bias_1 : bias_2;
+//     size_t weights = mGemmToProfile == GemmToProfile::GEMM_1 ? weights_1 : weights_2;
+//     size_t bias = mGemmToProfile == GemmToProfile::GEMM_1 ? bias_1 : bias_2;
 
-    // TODO Make quant 2 & 4 bigger for FP8 if we ever change to scaling per expert
-    bool is_int_w_quant = mWType == nvinfer1::DataType::kINT8 || mWType == nvinfer1::DataType::kINT4;
-    bool is_fp8_w_quant = mWType == nvinfer1::DataType::kFP8;
+//     // TODO Make quant 2 & 4 bigger for FP8 if we ever change to scaling per expert
+//     bool is_int_w_quant = mWType == nvinfer1::DataType::kINT8 || mWType == nvinfer1::DataType::kINT4;
+//     bool is_fp8_w_quant = mWType == nvinfer1::DataType::kFP8;
 
-    // Int sizes
-    size_t quant_1 = is_int_w_quant ? fc1_out_size * num_experts_per_node * dtype_bytes : 0;
-    size_t quant_2 = is_int_w_quant ? hidden_size * num_experts_per_node * dtype_bytes : 0;
+//     // Int sizes
+//     size_t quant_1 = is_int_w_quant ? fc1_out_size * num_experts_per_node * dtype_bytes : 0;
+//     size_t quant_2 = is_int_w_quant ? hidden_size * num_experts_per_node * dtype_bytes : 0;
 
-    // FP8 sizes
-    quant_1 = is_fp8_w_quant ? num_experts_per_node * sizeof(float) : quant_1;
-    quant_2 = is_fp8_w_quant ? sizeof(float) : quant_2;
-    size_t quant_3 = is_fp8_w_quant ? num_experts_per_node * sizeof(float) : 0;
-    size_t quant_4 = 0; // Currently ignored by the GEMM
+//     // FP8 sizes
+//     quant_1 = is_fp8_w_quant ? num_experts_per_node * sizeof(float) : quant_1;
+//     quant_2 = is_fp8_w_quant ? sizeof(float) : quant_2;
+//     size_t quant_3 = is_fp8_w_quant ? num_experts_per_node * sizeof(float) : 0;
+//     size_t quant_4 = 0; // Currently ignored by the GEMM
 
-    size_t hopper_workspace_size = 0;
-    if (is_hopper)
-    {
-        hopper_workspace_size = HopperGroupedGemmInput::workspaceSize(num_experts_per_node);
-    }
+//     size_t hopper_workspace_size = 0;
+//     if (is_hopper)
+//     {
+//         hopper_workspace_size = HopperGroupedGemmInput::workspaceSize(num_experts_per_node);
+//     }
 
-    size_t alpha_scale_ptr_array_size = num_experts_per_node * sizeof(float**);
-    size_t gemm_workspace_size = mInterface->getGemmWorkspaceSize(num_experts_per_node);
+//     size_t alpha_scale_ptr_array_size = num_experts_per_node * sizeof(float**);
+//     size_t gemm_workspace_size = mInterface->getGemmWorkspaceSize(num_experts_per_node);
 
-    // Routing info
-    size_t expert_first_token_offset_size = (num_experts_per_node + 1) * sizeof(int64_t) * NUM_ROUTING_SAMPLES;
-    size_t map_size = NUM_ROUTING_SAMPLES * num_expanded_tokens * sizeof(int);
-    size_t unpermuted_size = NUM_ROUTING_SAMPLES * num_expanded_tokens * sizeof(int);
-    size_t permuted_size = num_expanded_tokens * sizeof(int);
-    size_t sorter_ws_size = mSorter.getWorkspaceSize(num_expanded_tokens, mNumExperts);
-    size_t token_topk_final_scale_size = num_expanded_tokens * sizeof(float);
+//     // Routing info
+//     size_t expert_first_token_offset_size = (num_experts_per_node + 1) * sizeof(int64_t) * NUM_ROUTING_SAMPLES;
+//     size_t map_size = NUM_ROUTING_SAMPLES * num_expanded_tokens * sizeof(int);
+//     size_t unpermuted_size = NUM_ROUTING_SAMPLES * num_expanded_tokens * sizeof(int);
+//     size_t permuted_size = num_expanded_tokens * sizeof(int);
+//     size_t sorter_ws_size = mSorter.getWorkspaceSize(num_expanded_tokens, mNumExperts);
+//     size_t token_topk_final_scale_size = num_expanded_tokens * sizeof(float);
 
-    // Warning: order is sensitive. Routing info must be first and gemm_workspace_size must be last
-    return {// These go first because they are needed for prepare
-        expert_first_token_offset_size, map_size, map_size, unpermuted_size, unpermuted_size, permuted_size,
-        permuted_size, sorter_ws_size, token_topk_final_scale_size,
-        // The below are for the actual run
-        input_size, output_size, intermediate_size, weights, bias, quant_1, quant_2, quant_3, quant_4,
-        hopper_workspace_size, alpha_scale_ptr_array_size, gemm_workspace_size};
-}
+//     // Warning: order is sensitive. Routing info must be first and gemm_workspace_size must be last
+//     return {// These go first because they are needed for prepare
+//         expert_first_token_offset_size, map_size, map_size, unpermuted_size, unpermuted_size, permuted_size,
+//         permuted_size, sorter_ws_size, token_topk_final_scale_size,
+//         // The below are for the actual run
+//         input_size, output_size, intermediate_size, weights, bias, quant_1, quant_2, quant_3, quant_4,
+//         hopper_workspace_size, alpha_scale_ptr_array_size, gemm_workspace_size};
+// }
 
 size_t GemmProfilerBackend::getWorkspaceSize(int maxM)
 {
@@ -2091,124 +2179,124 @@ std::function<void*()> GemmProfilerBackend::getWorkspacePointerGenerator(char* w
     return getNext;
 }
 
-void GemmProfilerBackend::runProfiler(
-    int original_num_tokens, Config const& tactic, char* workspace_ptr_char, cudaStream_t const& stream)
-{
-    int64_t expanded_num_tokens = original_num_tokens * mK;
-    int64_t num_experts_per_node = mNumExpertsPerNode;
+// void GemmProfilerBackend::runProfiler(
+//     int original_num_tokens, Config const& tactic, char* workspace_ptr_char, cudaStream_t const& stream)
+// {
+//     int64_t expanded_num_tokens = original_num_tokens * mK;
+//     int64_t num_experts_per_node = mNumExpertsPerNode;
 
-    mSampleIndex = (mSampleIndex + 1) % NUM_ROUTING_SAMPLES;
+//     mSampleIndex = (mSampleIndex + 1) % NUM_ROUTING_SAMPLES;
 
-    auto workspaces = getProfilerWorkspaces(original_num_tokens, tactic.is_sm90);
-    auto getNext = getWorkspacePointerGenerator(workspace_ptr_char, original_num_tokens, tactic.is_sm90);
-    // Routing goes first as we need to manually initialise it in prepare(), everything else can be uninit
-    // If we didn't init routing all the values could go to one expert, causing the profile to be unreliable
-    auto const* expert_first_token_offset
-        = static_cast<int64_t const*>(getNext()) + mSampleIndex * (mNumExpertsPerNode + 1);
-    auto const* source_to_dest = static_cast<int const*>(getNext()) + mSampleIndex * expanded_num_tokens;
-    auto const* dest_to_source = static_cast<int const*>(getNext()) + mSampleIndex * expanded_num_tokens;
-    auto const* expert_for_source_row = static_cast<int const*>(getNext()) + mSampleIndex * expanded_num_tokens;
+//     auto workspaces = getProfilerWorkspaces(original_num_tokens, tactic.is_sm90);
+//     auto getNext = getWorkspacePointerGenerator(workspace_ptr_char, original_num_tokens, tactic.is_sm90);
+//     // Routing goes first as we need to manually initialise it in prepare(), everything else can be uninit
+//     // If we didn't init routing all the values could go to one expert, causing the profile to be unreliable
+//     auto const* expert_first_token_offset
+//         = static_cast<int64_t const*>(getNext()) + mSampleIndex * (mNumExpertsPerNode + 1);
+//     auto const* source_to_dest = static_cast<int const*>(getNext()) + mSampleIndex * expanded_num_tokens;
+//     auto const* dest_to_source = static_cast<int const*>(getNext()) + mSampleIndex * expanded_num_tokens;
+//     auto const* expert_for_source_row = static_cast<int const*>(getNext()) + mSampleIndex * expanded_num_tokens;
 
-    std::ignore = getNext(); // Only used in prepare()
-    std::ignore = getNext(); // Only used in prepare()
-    std::ignore = getNext(); // Only used in prepare()
-    std::ignore = getNext(); // Only used in prepare()
+//     std::ignore = getNext(); // Only used in prepare()
+//     std::ignore = getNext(); // Only used in prepare()
+//     std::ignore = getNext(); // Only used in prepare()
+//     std::ignore = getNext(); // Only used in prepare()
 
-    // These are uninitialised so just alias them as they don't matter for performance
-    auto const* token_topk_unpermuted_scales = static_cast<float const*>(getNext());
-    auto const* token_topk_permuted_scales = token_topk_unpermuted_scales;
+//     // These are uninitialised so just alias them as they don't matter for performance
+//     auto const* token_topk_unpermuted_scales = static_cast<float const*>(getNext());
+//     auto const* token_topk_permuted_scales = token_topk_unpermuted_scales;
 
-    void const* inputs = getNext();
-    void* outputs = getNext();
-    void* intermediate = getNext();
-    void const* weights = getNext();
-    void const* bias = getNext();
-    void const* scale_1 = getNext();
-    void const* scale_2 = getNext();
-    void const* scale_3 = getNext();
-    void const* scale_4 = getNext();
-    void* hopper_workspace = getNext();
-    float const** alpha_scale_ptr_array = reinterpret_cast<float const**>(getNext());
-    void* gemm_workspace = getNext(); // NOTE we rely on this being last below (i.e. workspaces.back())
+//     void const* inputs = getNext();
+//     void* outputs = getNext();
+//     void* intermediate = getNext();
+//     void const* weights = getNext();
+//     void const* bias = getNext();
+//     void const* scale_1 = getNext();
+//     void const* scale_2 = getNext();
+//     void const* scale_3 = getNext();
+//     void const* scale_4 = getNext();
+//     void* hopper_workspace = getNext();
+//     float const** alpha_scale_ptr_array = reinterpret_cast<float const**>(getNext());
+//     void* gemm_workspace = getNext(); // NOTE we rely on this being last below (i.e. workspaces.back())
 
-    HopperGroupedGemmInput hopper_input_template;
-    if (tactic.is_sm90)
-    {
-        hopper_input_template.configureWorkspace(
-            static_cast<int8_t*>(hopper_workspace), num_experts_per_node, gemm_workspace, workspaces.back());
-    }
+//     HopperGroupedGemmInput hopper_input_template;
+//     if (tactic.is_sm90)
+//     {
+//         hopper_input_template.configureWorkspace(
+//             static_cast<int8_t*>(hopper_workspace), num_experts_per_node, gemm_workspace, workspaces.back());
+//     }
 
-    QuantParams quant_params;
-    if (mWType == nvinfer1::DataType::kINT8 || mWType == nvinfer1::DataType::kINT4)
-    {
-        TLLM_CHECK(scale_1 && scale_2);
-        quant_params = QuantParams::Int(scale_1, scale_2);
-    }
-    else if (mWType == nvinfer1::DataType::kFP8)
-    {
-        TLLM_CHECK(scale_1 && scale_2 && scale_3);
-        quant_params = QuantParams::FP8(static_cast<float const*>(scale_1), static_cast<float const*>(scale_2),
-            static_cast<float const*>(scale_3), static_cast<float const*>(scale_4));
-    }
+//     QuantParams quant_params;
+//     if (mWType == nvinfer1::DataType::kINT8 || mWType == nvinfer1::DataType::kINT4)
+//     {
+//         TLLM_CHECK(scale_1 && scale_2);
+//         quant_params = QuantParams::Int(scale_1, scale_2);
+//     }
+//     else if (mWType == nvinfer1::DataType::kFP8)
+//     {
+//         TLLM_CHECK(scale_1 && scale_2 && scale_3);
+//         quant_params = QuantParams::FP8(static_cast<float const*>(scale_1), static_cast<float const*>(scale_2),
+//             static_cast<float const*>(scale_3), static_cast<float const*>(scale_4));
+//     }
 
-    mInterface->is_profiler = true;
-    if (mGemmToProfile == GemmToProfile::GEMM_1)
-    {
-        mInterface->gemm1(inputs,                             //
-            outputs,                                          //
-            intermediate,                                     //
-            expert_first_token_offset,                        //
-            hopper_input_template,                            //
-            weights,                                          //
-            bias,                                             //
-            expert_first_token_offset + num_experts_per_node, //
-            quant_params.fc1_weight_scales,                   //
-            quant_params.dequant_fc1,                         //
-            quant_params.quant_fc2,                           //
-            expanded_num_tokens,                              //
-            mExpertHiddenSize,                                //
-            mExpertInterSize,                                 //
-            num_experts_per_node,                             //
-            mActivationType,                                  //
-            alpha_scale_ptr_array,                            //
-            true,                                              //
-            stream,                                           //
-            tactic);
-    }
-    else
-    {
-        TLLM_CHECK(mGemmToProfile == GemmToProfile::GEMM_2);
-        mInterface->gemm2(inputs,                           //
-            intermediate,                                   //
-            outputs,                                        //
-            expert_first_token_offset,                      //
-            hopper_input_template,                          //
-            weights,                                        //
-            bias,                                           //
-            quant_params.fc2_weight_scales,                 //
-            quant_params.dequant_fc2,                       //
-            token_topk_unpermuted_scales,                   //
-            token_topk_permuted_scales,                     //
-            source_to_dest,                                 //
-            dest_to_source,                                 //
-            expert_for_source_row,                          //
-            expert_first_token_offset + mNumExpertsPerNode, //
-            original_num_tokens,                            //
-            expanded_num_tokens,                            //
-            mExpertHiddenSize,                              //
-            mExpertInterSize,                               //
-            num_experts_per_node,                           //
-            mK,                                             //
-            !mInterface->use_deterministic_hopper_reduce_,  //
-            alpha_scale_ptr_array,                          //
-            stream,                                         //
-            mParallelismConfig,                             //
-            tactic);
-    }
-    mInterface->is_profiler = false;
+//     mInterface->is_profiler = true;
+//     if (mGemmToProfile == GemmToProfile::GEMM_1)
+//     {
+//         mInterface->gemm1(inputs,                             //
+//             outputs,                                          //
+//             intermediate,                                     //
+//             expert_first_token_offset,                        //
+//             hopper_input_template,                            //
+//             weights,                                          //
+//             bias,                                             //
+//             expert_first_token_offset + num_experts_per_node, //
+//             quant_params.fc1_weight_scales,                   //
+//             quant_params.dequant_fc1,                         //
+//             quant_params.quant_fc2,                           //
+//             expanded_num_tokens,                              //
+//             mExpertHiddenSize,                                //
+//             mExpertInterSize,                                 //
+//             num_experts_per_node,                             //
+//             mActivationType,                                  //
+//             alpha_scale_ptr_array,                            //
+//             true,                                              //
+//             stream,                                           //
+//             tactic);
+//     }
+//     else
+//     {
+//         TLLM_CHECK(mGemmToProfile == GemmToProfile::GEMM_2);
+//         mInterface->gemm2(inputs,                           //
+//             intermediate,                                   //
+//             outputs,                                        //
+//             expert_first_token_offset,                      //
+//             hopper_input_template,                          //
+//             weights,                                        //
+//             bias,                                           //
+//             quant_params.fc2_weight_scales,                 //
+//             quant_params.dequant_fc2,                       //
+//             token_topk_unpermuted_scales,                   //
+//             token_topk_permuted_scales,                     //
+//             source_to_dest,                                 //
+//             dest_to_source,                                 //
+//             expert_for_source_row,                          //
+//             expert_first_token_offset + mNumExpertsPerNode, //
+//             original_num_tokens,                            //
+//             expanded_num_tokens,                            //
+//             mExpertHiddenSize,                              //
+//             mExpertInterSize,                               //
+//             num_experts_per_node,                           //
+//             mK,                                             //
+//             !mInterface->use_deterministic_hopper_reduce_,  //
+//             alpha_scale_ptr_array,                          //
+//             stream,                                         //
+//             mParallelismConfig,                             //
+//             tactic);
+//     }
+//     mInterface->is_profiler = false;
 
-    sync_check_cuda_error();
-}
+//     sync_check_cuda_error();
+// }
 
 // ==================== Variable batched GEMM specializations ==================================
 template class CutlassMoeFCRunner<float, float>;
@@ -2227,6 +2315,7 @@ template class CutlassMoeFCRunner<half, cutlass::uint4b_t>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, half>;
 #ifdef ENABLE_BF16
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>;
+template class CutlassMoeFCRunner<__nv_bfloat16, __nv_fp8_e4m3, __nv_bfloat16>;
 #endif
 #endif
 

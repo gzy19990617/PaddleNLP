@@ -32,17 +32,6 @@ from csrc.gpu.moe.fused_moe_triton.fused_moe import fused_moe
 
 
 
-class ExpertScaleNormalizationMode(IntEnum):
-    NONE = 0
-    RENORMALIZE = 1
-    SPARSE_MIXER = 2
-    DEVICE_LIMITED = 3
-    DEVICE_LIMITED_RENORM = 4
-
-print()
-
-
-
 # Constants
 DTYPES = paddle.bfloat16
 # DTYPES = paddle.float32

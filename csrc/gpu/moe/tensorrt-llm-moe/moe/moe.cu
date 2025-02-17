@@ -13,15 +13,40 @@
 #include <cstdio>
 
 template <typename T>
-void print_gpu_data(T* gpu_data, size_t num_elements) {
+void print_to_screen1(const T* result, const int length, const int size) {
+  if (result == nullptr) {
+    return;
+  }
+  T* tmp = reinterpret_cast<T*>(malloc(sizeof(T) * length));
+  cudaMemcpy(tmp, result, sizeof(T) * length, cudaMemcpyDeviceToHost);
+  for (int i = 0; i < size; ++i) {
+    std::cout << i << ",  " << static_cast<float>(tmp[i]) << std::endl; // Cast to float for printing
+  }
+  free(tmp);
+}
+
+// Explicit template instantiations
+template void print_to_screen1(const float* result, const int length, const int size);
+template void print_to_screen1(const half* result, const int length, const int size);
+template void print_to_screen1(const int* result, const int length, const int size);
+template void print_to_screen1(const int64_t* result, const int length, const int size);
+
+
+
+template <typename T>
+void print_gpu_data(T* gpu_data, size_t num_elements, size_t num) {
     // 在主机上创建一个缓冲区来接收 GPU 数据
     float* host_data = new float[num_elements];
 
     // 创建一个用于转换数据的缓冲区
     T* temp_data = new T[num_elements];
 
-    // 从 GPU 拷贝数据到临时缓冲区（float32）
-    cudaMemcpy(temp_data, gpu_data, sizeof(float) * num_elements, cudaMemcpyDeviceToHost);
+    // 从 GPU 拷贝数据到临时缓冲区
+    cudaError_t err = cudaMemcpy(temp_data, gpu_data, sizeof(T) * num_elements, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        printf("CUDA Error: %s\n", cudaGetErrorString(err));
+        return;
+    }
 
     // 将转换后的数据拷贝到主机数据缓冲区
     for (size_t i = 0; i < num_elements; i++) {
@@ -29,8 +54,8 @@ void print_gpu_data(T* gpu_data, size_t num_elements) {
     }
 
     // 打印前几个元素
-    for (size_t i = 0; i < num_elements; i++) {
-        printf("gpu_data[%zu] = %f\n", i, host_data[i]);
+    for (size_t i = 0; i < num; i++) {
+        printf("gpu_data ？？？ [%zu] = %f\n", i, host_data[i]);
     }
 
     // 释放内存
@@ -124,6 +149,25 @@ tensorrt_llm::ActivationType getActivationType(std::string activation_type_str)
     return tensorrt_llm::ActivationType::InvalidType;
 }
 
+tensorrt_llm::kernels::MOEExpertScaleNormalizationMode getNormalizationMode(int normalization_mode) {
+    switch (normalization_mode) {
+        case 0:
+            return tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::NONE;
+        case 1:
+            return tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::RENORMALIZE;
+        case 2:
+            return tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::SPARSE_MIXER;
+        case 3:
+            return tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::DEVICE_LIMITED;
+        case 4:
+            return tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::DEVICE_LIMITED_RENORM;
+        default:
+            std::cerr << "Unknown normalization_mode value: " << normalization_mode << std::endl;
+            // Return a default value if an invalid mode is passed
+            return tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::NONE;
+    }
+}
+
 
 template<typename T, typename WeightType>
 Tensor trt_llm_fused_moe_helper(Tensor input_activations, 
@@ -136,6 +180,7 @@ Tensor trt_llm_fused_moe_helper(Tensor input_activations,
                                  paddle::optional<paddle::Tensor> scale1 = nullptr,
                                  paddle::optional<paddle::Tensor> scale2 = nullptr,
                                  paddle::optional<paddle::Tensor> scale3 = nullptr,
+                                 int normalization_mode = 0,
                                  const std::string& quant_method = "none")
 {
     typedef DataTypeMapper<T> traits_t;
@@ -148,159 +193,151 @@ Tensor trt_llm_fused_moe_helper(Tensor input_activations,
 
     const int num_rows = input_activations.shape()[0];
     const int hidden_size = input_activations.shape()[1];
-    const int inter_size = fc2_expert_weights.shape()[1];
-    const int num_experts = gating_output.shape()[0];
+
+    const int inter_size = fc2_expert_weights.shape()[1]; //1408
+    // const int inter_size = fc1_expert_weights.shape()[2]; // 2816
+
+    const int num_experts = gating_output.shape()[1];
     auto stream = input_activations.stream();
     auto place = input_activations.place();
+    phi::Allocator* allocator = paddle::GetAllocator(place);
 
-    data_t* input_act_ptr = get_ptr<data_t>(input_activations);
-    float* gating_output_ptr = get_ptr<float>(gating_output);
+    
+    T* input_act_ptr = reinterpret_cast<T*>(input_activations.data<data_t>());
+    float* gating_output_ptr =  reinterpret_cast<float*>(gating_output.data<float>());
 
-    float* scale1_ptr = scale1 ? get_ptr<float>(scale1) : nullptr;
-    float* scale2_ptr = scale2 ? get_ptr<float>(scale2) : nullptr;
-    float* scale3_ptr = scale3 ? get_ptr<float>(scale3) : nullptr;
 
-    data_t* fc1_expert_biases_ptr = nullptr;
-    data_t* fc2_expert_biases_ptr = nullptr;
+    T* fc1_expert_biases_ptr = nullptr;
+    T* fc2_expert_biases_ptr = nullptr;
 
 
     bool* finished_ptr = nullptr;
 
     tensorrt_llm::kernels::MOEParallelismConfig moe_parallel_config = tensorrt_llm::kernels::MOEParallelismConfig(1, 0, 1, 0);
 
-    
+    void* scale1_ptr = nullptr;
+    void* scale2_ptr = nullptr;
+    void* scale3_ptr = nullptr;
+
+    std::cout <<"in 0" << std::endl;
+
+    WeightType* fc1_weights_ptr = reinterpret_cast<WeightType*>(fc1_expert_weights.data<data_w>());
+    WeightType* fc2_weights_ptr = reinterpret_cast<WeightType*>(fc2_expert_weights.data<data_w>());
+
     // 根据启用的量化方法设置量化参数
     tensorrt_llm::kernels::QuantParams quant_params;
     if (quant_method == "fp8_pre_tensor") {
         std::cout <<"fp8_pre_tensor" << std::endl;
-        quant_params = tensorrt_llm::kernels::QuantParams::FP8(scale1_ptr, scale2_ptr, scale3_ptr);
-    } else if (quant_method == "weight_only_int8") {
+        // scale1_ptr = get_ptr<data_t>(scale1);
+        // scale2_ptr = get_ptr<data_t>(scale2);
+        // scale3_ptr = get_ptr<data_t>(scale3);
+        // quant_params = tensorrt_llm::kernels::QuantParams::FP8(scale1_ptr, scale2_ptr, scale3_ptr);
+    } else if (quant_method == "weight_only_int8" || quant_method == "weight_only_int4") {
+        scale1_ptr = get_ptr<data_t>(scale1);
+        scale2_ptr = get_ptr<data_t>(scale2);
         quant_params = tensorrt_llm::kernels::QuantParams::Int(scale1_ptr, scale2_ptr);
-        std::cout <<   "weight_only_int8 quant parmra done !" << std::endl;
-    } else if (quant_method == "weight_only_int4") {
-        quant_params = tensorrt_llm::kernels::QuantParams::Int(scale1_ptr, scale2_ptr);
+    } else if (quant_method == "fp8_block_wise") {
+        scale1_ptr = get_ptr<float>(scale1);
+        scale2_ptr = get_ptr<float>(scale2);
     }
 
 
+    // print_gpu_data<T>(fc1_weights_ptr, 64*2048*2816, 15);
+    std::cout <<"in 1" << std::endl;
+    tensorrt_llm::kernels::BlockScaleParams deepseek_params;
+    bool use_deepseek = false;
+    if (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<WeightType, __nv_fp8_e4m3>) {
+        use_deepseek = true;
+    }
+    if (use_deepseek)
+    {    
+         std::cout <<"in 2" << std::endl;
+        using BlockScaleGemmImplPtr = std::shared_ptr<tensorrt_llm::kernels::small_m_gemm::CutlassFp8BlockScaleGemmRunnerInterface>;
+        BlockScaleGemmImplPtr mBlockScaleGemmImplPtr = std::make_shared<tensorrt_llm::kernels::small_m_gemm::CutlassFp8BlockScaleGemmRunner<__nv_bfloat16,
+                        __nv_fp8_e4m3, __nv_bfloat16>>();;
+        size_t deepseek_workspace_size = 0;
+        cudaEvent_t mMemcpyEvent;
+        bool is_gated_activation = isGatedActivation(fc1_activation_type);
+        int factor = is_gated_activation ? 2 : 1;
+        size_t deepseek_fc1_size = mBlockScaleGemmImplPtr->getWorkspaceSize(
+            num_rows * k, factor * inter_size, hidden_size, num_experts);
+        size_t deepseek_fc2_size = mBlockScaleGemmImplPtr->getWorkspaceSize(
+            num_rows * k, hidden_size, inter_size, num_experts);
+        deepseek_workspace_size = std::max(deepseek_fc1_size, deepseek_fc2_size);
+
+        auto deepseek_ws = allocator->Allocate(deepseek_workspace_size)->ptr();
+        std::cout <<"in 3" << std::endl;
+        // print_gpu_data<float>(scale1_ptr, 256 * 2 * 56, 15);
+        auto fc1_scales_ptr = static_cast<float const*>(scale1_ptr);
+        auto fc2_scales_ptr = static_cast<float const*>(scale2_ptr);
+
+        deepseek_params = tensorrt_llm::kernels::BlockScaleParams(
+            fc1_scales_ptr, fc2_scales_ptr, mBlockScaleGemmImplPtr, reinterpret_cast<char*>(deepseek_ws), &mMemcpyEvent);
+    }
+
+    // deepseek相关参数
     int sm = getSMVersion();
+    std::cout <<"in 4 hahhahahaha" << std::endl;
     tensorrt_llm::kernels::CutlassMoeFCRunner<T, WeightType> moe_runner;
+    std::cout <<"in 5" << std::endl;
 
     auto [tactic1, tactic2] = selectTacticsForArch(moe_runner, sm);
     moe_runner.setTactic(std::make_optional(tactic1), std::make_optional(tactic2));
 
-    auto bytes = moe_runner.getWorkspaceSize(num_rows, hidden_size, inter_size, num_experts, k, fc1_activation_type, 
-                                             tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::RENORMALIZE, moe_parallel_config);
+    tensorrt_llm::kernels::MOEExpertScaleNormalizationMode normalization_mode_enum = getNormalizationMode(normalization_mode);
 
-    auto workspace_tensor = paddle::empty({static_cast<int>(bytes)}, paddle::DataType::UINT8, place);
-    uint8_t* uint8_ptr = get_ptr<uint8_t>(workspace_tensor);
-    char* workspace_ptr = reinterpret_cast<char*>(uint8_ptr);
+    auto bytes = moe_runner.getWorkspaceSize(num_rows, hidden_size, inter_size, num_experts, k, fc1_activation_type, 
+                                             normalization_mode_enum, moe_parallel_config, use_deepseek);
+
+    auto workspace_ptr = allocator->Allocate(bytes)->ptr();
+    std::cout << "我使用了allocator"<< std::endl;
+
+    // auto workspace_tensor = paddle::empty({static_cast<int>(bytes)}, paddle::DataType::UINT8, place);
+    // uint8_t* uint8_ptr = get_ptr<uint8_t>(workspace_tensor);
+    // char* workspace_ptr = reinterpret_cast<char*>(uint8_ptr);
 
     auto fc2_output = paddle::empty({k * num_rows, hidden_size}, input_activations.dtype(), place);
     auto expert_scales = paddle::empty({num_rows, k}, input_activations.dtype(), place);
-    data_t* expert_scales_ptr = get_ptr<data_t>(expert_scales);
+
+    T* expert_scales_ptr = reinterpret_cast<T*>(expert_scales.data<data_t>());
 
     auto expanded_source_row_to_expanded_dest_row = paddle::empty({num_rows, k}, paddle::DataType::INT32, place);
-    int* expanded_source_row_to_expanded_dest_row_ptr = get_ptr<int>(expanded_source_row_to_expanded_dest_row);
+    int* expanded_source_row_to_expanded_dest_row_ptr = reinterpret_cast<int*>(expanded_source_row_to_expanded_dest_row.data<int>());
 
     auto expert_for_source_row = paddle::empty({num_rows, k}, paddle::DataType::INT32, place);
-    int* expert_for_source_row_ptr = get_ptr<int>(expert_for_source_row);
+
+    int* expert_for_source_row_ptr = reinterpret_cast<int*>(expert_for_source_row.data<int>());
 
     auto output_tensor = paddle::empty({num_rows, hidden_size}, input_activations.dtype(), place);
-    data_t* output_tensor_ptr = get_ptr<data_t>(output_tensor);
+    T* output_tensor_ptr = reinterpret_cast<T*>(output_tensor.data<data_t>());
 
 
-
-    if (quant_method == "weight_only_int8") {
-        std::cout << "start runMoe 99999"<< std::endl;
-        // auto w1 = reinterpret_cast<uint8_t*>(fc1_expert_weights.data<uint8_t>());
-        // auto w2 = reinterpret_cast<uint8_t*>(fc2_expert_weights.data<uint8_t>());
-        // printf("fc1_expert_weights = %f\n", w1[0]);
-        // printf("fc1_expert_weights = %f\n", w2[0]);
-        // print_gpu_data<uint8_t>(w1, 10);
-        // print_gpu_data<uint8_t>(w2, 10);
-        // std::cout << "print end "<< std::endl;
-        moe_runner.runMoe(input_act_ptr,
-                      gating_output_ptr,
-                      reinterpret_cast<uint8_t*>(fc1_expert_weights.data<int8_t>()),
-                      fc1_expert_biases_ptr,
-                      fc1_activation_type,
-                      reinterpret_cast<uint8_t*>(fc1_expert_weights.data<int8_t>()),
-                      fc2_expert_biases_ptr,
-                      quant_params,
-                      num_rows,
-                      hidden_size,
-                      inter_size,
-                      num_experts,
-                      k,
-                      workspace_ptr,
-                      output_tensor_ptr,
-                      finished_ptr,
-                      active_rows,
-                      expert_scales_ptr,
-                      expanded_source_row_to_expanded_dest_row_ptr,
-                      expert_for_source_row_ptr,
-                      0.2f,  // sparse_mixer_epsilon
-                      moe_parallel_config,
-                      tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::RENORMALIZE,
-                      stream);
-
-    } else if (quant_method == "weight_only_int4") {
-        std::cout << "start runMoe 4444"<< std::endl;
-        moe_runner.runMoe(input_act_ptr,
-                      gating_output_ptr,
-                      reinterpret_cast<cutlass::uint4b_t*>(fc1_expert_weights.data<int8_t>()),
-                      fc1_expert_biases_ptr,
-                      fc1_activation_type,
-                      reinterpret_cast<cutlass::uint4b_t*>(fc2_expert_weights.data<int8_t>()),
-                      fc2_expert_biases_ptr,
-                      quant_params,
-                      num_rows,
-                      hidden_size,
-                      inter_size,
-                      num_experts,
-                      k,
-                      workspace_ptr,
-                      output_tensor_ptr,
-                      finished_ptr,
-                      active_rows,
-                      expert_scales_ptr,
-                      expanded_source_row_to_expanded_dest_row_ptr,
-                      expert_for_source_row_ptr,
-                      0.2f,  // sparse_mixer_epsilon
-                      moe_parallel_config,
-                      tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::RENORMALIZE,
-                      stream);
-    } else {
-        std::cout << "start runMoe"<< std::endl;
-        // auto hah = get_ptr<data_w>(fc1_expert_weights);
-        // print_gpu_data<data_w>(hah, 10);
-        moe_runner.runMoe(input_act_ptr,
-                      gating_output_ptr,
-                      get_ptr<data_w>(fc1_expert_weights),
-                      fc1_expert_biases_ptr,
-                      fc1_activation_type,
-                      get_ptr<data_w>(fc2_expert_weights),
-                      fc2_expert_biases_ptr,
-                      quant_params,
-                      num_rows,
-                      hidden_size,
-                      inter_size,
-                      num_experts,
-                      k,
-                      workspace_ptr,
-                      output_tensor_ptr,
-                      finished_ptr,
-                      active_rows,
-                      expert_scales_ptr,
-                      expanded_source_row_to_expanded_dest_row_ptr,
-                      expert_for_source_row_ptr,
-                      0.2f,  // sparse_mixer_epsilon
-                      moe_parallel_config,
-                      tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::RENORMALIZE,
-                      stream);
-    }
-
-    
+    moe_runner.runMoe(input_act_ptr,
+                    gating_output_ptr,
+                    fc1_weights_ptr,
+                    fc1_expert_biases_ptr,
+                    fc1_activation_type,
+                    fc2_weights_ptr,
+                    fc2_expert_biases_ptr,
+                    quant_params,
+                    num_rows,
+                    hidden_size,
+                    inter_size,
+                    num_experts,
+                    k,
+                    reinterpret_cast<char*>(workspace_ptr),
+                    output_tensor_ptr,
+                    finished_ptr,
+                    active_rows,
+                    expert_scales_ptr,
+                    expanded_source_row_to_expanded_dest_row_ptr,
+                    expert_for_source_row_ptr,
+                    0.2f,  // sparse_mixer_epsilon
+                    moe_parallel_config,
+                    normalization_mode_enum,
+                    use_deepseek,
+                    deepseek_params,
+                    stream);
     return output_tensor;
 }
 
@@ -329,7 +366,7 @@ Tensor trt_llm_fused_moe_helper_fp8_per_tensor(Tensor input_activations,
     const int num_rows = input_activations.shape()[0];
     const int hidden_size = input_activations.shape()[1];
     const int inter_size = fc2_expert_weights.shape()[1];
-    const int num_experts = gating_output.shape()[0];
+    const int num_experts = gating_output.shape()[1];
     auto stream = input_activations.stream();
     auto place = input_activations.place();
 
@@ -356,13 +393,14 @@ Tensor trt_llm_fused_moe_helper_fp8_per_tensor(Tensor input_activations,
 
     int sm = getSMVersion();
     tensorrt_llm::kernels::CutlassMoeFCRunner<T, WeightType, __nv_bfloat16> moe_runner;
-
+    tensorrt_llm::kernels::BlockScaleParams deepseek_params;
+    bool use_deepseek = false;
 
     auto [tactic1, tactic2] = selectTacticsForArch(moe_runner, sm);
     moe_runner.setTactic(std::make_optional(tactic1), std::make_optional(tactic2));
 
     auto bytes = moe_runner.getWorkspaceSize(num_rows, hidden_size, inter_size, num_experts, k, fc1_activation_type, 
-                                             tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::RENORMALIZE, moe_parallel_config);
+                                             tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::RENORMALIZE, moe_parallel_config, false);
 
     auto workspace_tensor = paddle::empty({static_cast<int>(bytes)}, paddle::DataType::UINT8, place);
     uint8_t* uint8_ptr = get_ptr<uint8_t>(workspace_tensor);
@@ -404,6 +442,8 @@ Tensor trt_llm_fused_moe_helper_fp8_per_tensor(Tensor input_activations,
                       0.2f,  // sparse_mixer_epsilon
                       moe_parallel_config,
                       tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::RENORMALIZE,
+                      use_deepseek,
+                      deepseek_params,
                       stream);
 
     return output_tensor;
@@ -417,30 +457,30 @@ std::vector<paddle::Tensor> TrtLLMFusedMoe(const paddle::Tensor&     input_activ
                 const paddle::optional<paddle::Tensor>& scale1,
                 const paddle::optional<paddle::Tensor>& scale2,
                 const paddle::optional<paddle::Tensor>& scale3,
-                const std::string& fc1_activation_type_str,
-                int     active_rows,
                 int     k,
+                int normalization_mode = 1,
                 const std::string& quant_method="none")
 {
 
     const auto _st = input_activations.dtype();
     const auto weight_type = fc1_expert_weights.dtype();
-
+    int     active_rows;
     const int num_rows    = input_activations.shape()[0];
     const int hidden_size = input_activations.shape()[1];
-    const int num_experts = gating_output.shape()[0];
+    const int num_experts = gating_output.shape()[1];
 
     const auto quant_type = fc2_expert_weights.dtype();
 
     Tensor output_tensor;
 
-    tensorrt_llm::ActivationType fc1_activation_type = tensorrt_llm::ActivationType::InvalidType;
-    if (fc1_activation_type_str == "identity") {
-        fc1_activation_type = tensorrt_llm::ActivationType::Identity;
-    }
-    else {
-        fc1_activation_type = getActivationType(fc1_activation_type_str);
-    }
+    tensorrt_llm::ActivationType fc1_activation_type = tensorrt_llm::ActivationType::Swiglu;;
+    active_rows = num_rows;
+    // if (fc1_activation_type_str == "identity") {
+    //     fc1_activation_type = tensorrt_llm::ActivationType::Identity;
+    // }
+    // else {
+    //     fc1_activation_type = getActivationType(fc1_activation_type_str);
+    // }
 
     std::cout << "start ! "<< std::endl;
     std::cout<< quant_method  << std::endl;
@@ -454,7 +494,12 @@ std::vector<paddle::Tensor> TrtLLMFusedMoe(const paddle::Tensor&     input_activ
                                                                 fc1_activation_type,
                                                                 fc2_expert_weights,
                                                                 active_rows,
-                                                                k);
+                                                                k,
+                                                                nullptr,
+                                                                nullptr,
+                                                                nullptr,
+                                                                normalization_mode,
+                                                                quant_method);
             }
             else {
                 std::string err_msg = "Unsupported weight type ";
@@ -471,7 +516,12 @@ std::vector<paddle::Tensor> TrtLLMFusedMoe(const paddle::Tensor&     input_activ
                                                                     fc1_activation_type,
                                                                     fc2_expert_weights,
                                                                     active_rows,
-                                                                    k);
+                                                                    k,
+                                                                    nullptr,
+                                                                    nullptr,
+                                                                    nullptr,
+                                                                    normalization_mode,
+                                                                    quant_method);
             }
             else {
                 std::string err_msg = "Unsupported weight type ";
@@ -488,7 +538,12 @@ std::vector<paddle::Tensor> TrtLLMFusedMoe(const paddle::Tensor&     input_activ
                                                                                 fc1_activation_type,
                                                                                 fc2_expert_weights,
                                                                                 active_rows,
-                                                                                k);
+                                                                                k,
+                                                                                nullptr,
+                                                                                nullptr,
+                                                                                nullptr,
+                                                                                normalization_mode,
+                                                                                quant_method);
             }
             else {
                 if (quant_method == "weight_only_int8") {
@@ -501,7 +556,8 @@ std::vector<paddle::Tensor> TrtLLMFusedMoe(const paddle::Tensor&     input_activ
                                                                                 k,
                                                                                 scale1,
                                                                                 scale2,
-                                                                                scale3, //scale3不需要
+                                                                                nullptr, //scale3不需要
+                                                                                normalization_mode,
                                                                                 quant_method);
                 } else if (quant_method == "weight_only_int4") {
                     output_tensor = trt_llm_fused_moe_helper<__nv_bfloat16, cutlass::uint4b_t>(input_activations,
@@ -514,10 +570,21 @@ std::vector<paddle::Tensor> TrtLLMFusedMoe(const paddle::Tensor&     input_activ
                                                                                 scale1,
                                                                                 scale2,
                                                                                 nullptr, //scale3不需要
+                                                                                normalization_mode,
                                                                                 quant_method);
                 } else if (quant_method == "fp8_block_wise") {
-                    std::string err_msg = "Unsupported weight type ";
-                    throw std::runtime_error(err_msg);
+                    output_tensor = trt_llm_fused_moe_helper<__nv_bfloat16, __nv_fp8_e4m3>(input_activations,
+                                                                                gating_output,
+                                                                                fc1_expert_weights,
+                                                                                fc1_activation_type,
+                                                                                fc2_expert_weights,
+                                                                                active_rows,
+                                                                                k,
+                                                                                scale1,
+                                                                                scale2,
+                                                                                nullptr, //scale3不需要
+                                                                                normalization_mode,
+                                                                                quant_method);
 
                 } else {
                     std::string err_msg = "Unsupported weight type ";
@@ -555,9 +622,8 @@ std::vector<paddle::Tensor> TrtLLMFusedMoe(const paddle::Tensor&     input_activ
 }
 
 
-
 PD_BUILD_OP(trt_llm_fused_moe)
     .Inputs({"input_activations", "gating_output", "fc1_expert_weights", "fc2_expert_weights", paddle::Optional("scale1"), paddle::Optional("scale2"), paddle::Optional("scale3"),})
     .Outputs({"output_tensor"})
-    .Attrs({"fc1_activation_type_str: std::string", "active_rows: int", "k: int", "quant_method:std::string"})
+    .Attrs({"k: int", "normalization_mode: int", "quant_method:std::string"})
     .SetKernelFn(PD_KERNEL(TrtLLMFusedMoe));
