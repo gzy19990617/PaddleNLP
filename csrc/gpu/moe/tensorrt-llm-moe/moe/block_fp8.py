@@ -33,11 +33,11 @@ from paddlenlp_ops import trt_llm_fused_moe
 
 # Constants
 DTYPES = paddle.bfloat16
-M = 8  # Batch size, token_num
+M = 8 # Batch size, token_num
 
 TP = 16
 N = 2048 // TP  # Intermediate size
-K = 2048  # Hidden size
+K = 4096  # Hidden size
 E = 256  # Number of experts
 TOP_KS = 8
 BLOCK_SIZE = [128, 128]  # Block-wise
@@ -55,8 +55,8 @@ score = paddle.randn((M, E), dtype=paddle.float32)
 
 # Bfloat16 input
 a = paddle.randn((M, K), dtype=paddle.bfloat16) / 10
-w1 = paddle.rand((E, 2 * N, K), dtype=paddle.bfloat16)
-w2 = paddle.rand((E, K, N), dtype=paddle.bfloat16)
+w1 = paddle.rand((E, K, 2 * N), dtype=paddle.bfloat16)  / 10
+w2 = paddle.rand((E , N, K), dtype=paddle.bfloat16)  / 10
 
 # FP8 scaling
 factor_for_scale = 1e-2
@@ -76,10 +76,10 @@ k_tiles_w2 = (N + block_k - 1) // block_k
 # Scale for w1 and w2
 w1_s = paddle.rand((E, n_tiles_w1, k_tiles_w1), dtype=paddle.float32) * factor_for_scale
 w2_s = paddle.rand((E, n_tiles_w2, k_tiles_w2), dtype=paddle.float32) * factor_for_scale
-print(w1_s.shape)
+# print(w1_s.shape)
 
-w1_s = paddle.rand((E, n_tiles_w1 * k_tiles_w1), dtype=paddle.float32) * factor_for_scale
-w2_s = paddle.rand((E, n_tiles_w2 * k_tiles_w2), dtype=paddle.float32) * factor_for_scale
+# w1_s = paddle.rand((E, n_tiles_w1 * k_tiles_w1), dtype=paddle.float32) * factor_for_scale
+# w2_s = paddle.rand((E, n_tiles_w2 * k_tiles_w2), dtype=paddle.float32) * factor_for_scale
 
 
 # def moe(i):
@@ -105,8 +105,8 @@ def moe_fp8(i):
     out = trt_llm_fused_moe(
             a,
             score,
-            w1_fp8.reshape([E, K, -1]),
-            w2_fp8.reshape([E, -1, K]),
+            w1_fp8,
+            w2_fp8,
             # w1_s.reshape([E, k_tiles_w1, -1]),
             # w2_s.reshape([E, k_tiles_w2, -1]),
             w1_s,
@@ -115,6 +115,9 @@ def moe_fp8(i):
             topk,
             0,
             quant_method,
+            # "Swiglu"
+            # "Swiglu"
+            "silu"
         )
 
     paddle.device.synchronize()

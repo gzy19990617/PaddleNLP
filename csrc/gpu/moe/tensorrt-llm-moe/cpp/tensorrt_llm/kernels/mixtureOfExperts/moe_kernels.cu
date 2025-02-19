@@ -1145,7 +1145,7 @@ void doGatedActivation(T* output, OutputType const* gemm_result, int64_t const* 
 }
 
 // ============================== Activation =================================
-
+// 这里trt swiglu是（w3,w1）
 template <class T, class GemmOutputType, class ScaleBiasType, template <class> class ActFn>
 __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result, float const* fp8_quant,
     ScaleBiasType const* bias_ptr, bool bias_is_broadcast, int64_t const* expert_first_token_offset, int num_experts,
@@ -1849,13 +1849,13 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::runMo
         expert_for_source_row, source_rows_, num_rows, num_experts, k, start_expert, end_expert, sparse_mixer_epsilon,
         normalization_mode, stream);
 
-    // sync_check_cuda_error();
+    sync_check_cuda_error();
 
     sortAndScanSoftmaxOutput(expert_for_source_row, source_rows_, permuted_experts_, permuted_rows_,
         expert_first_token_offset_, num_rows, num_experts, num_experts_per_node, k, sorter_,
         static_cast<void*>(sorter_ws_), stream);
 
-    // sync_check_cuda_error();
+    sync_check_cuda_error();
 
     int64_t const expanded_num_rows = k * num_rows;
     bool is_gated_activation = isGatedActivation(fc1_activation_type);
